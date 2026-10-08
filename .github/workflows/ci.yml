@@ -10,3 +10,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: make test
       - run: IQC_NO_SIMD=1 ./tests/roundtrip
+      - name: sanitizers
+        run: make clean && make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all"

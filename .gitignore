@@ -3,3 +3,4 @@ tests/roundtrip
 *.o
 *.dat
 *.iqc
+*.dSYM/

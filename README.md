@@ -41,18 +41,22 @@ uhd_rx_cfile ... | iqcodec c - out.iqc   # stdin / stdout with -
 |---|---|
 | `-f fc32\|sc16` | input sample format (compress) |
 | `-s SCALE` | fc32 values are int16 / SCALE (default 32767) |
-| `-l` | allow fc32 input that is not exactly int16 / SCALE (it gets quantized; otherwise iqcodec refuses) |
+| `-l` | allow fc32 input that is not exactly int16 / SCALE (it gets quantized, and checksums and `-t` then cover the quantized values; otherwise iqcodec refuses) |
 | `-t` | compress: decode each chunk after encoding and compare with the input |
 | `-j N` | threads (default: CPUs, at most 8); chunks are coded independently |
 | `-v` | statistics |
+
+Options go before INPUT and OUTPUT.
 
 Every chunk stores a CRC-32C of its samples, and the stream ends with the total sample count.
 `d` and `t` check both, so corruption or truncation is an error instead of wrong data.
 `c -t` also catches encoder faults before you delete the original.
 
-Output goes to a temporary file in the same directory and is renamed into place only on success, so a
-failed run never leaves partial output and never replaces an existing file. iqcodec refuses an output that
-is the input file, whether by the same path, a symbolic or hard link, or a shell redirection.
+A file OUTPUT goes to a temporary file in the same directory. It is synced and renamed into place only on
+success, so a failed or interrupted run never leaves partial output and never replaces an existing file.
+A symlink OUTPUT keeps its link, and its target receives the data. stdout, pipes and devices get data as it
+is decoded, so a failure there can leave partial data. iqcodec refuses an output that is the input file,
+whether by the same path, a symbolic or hard link, or a shell redirection.
 
 ## How it works
 

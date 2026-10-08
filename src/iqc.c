@@ -46,10 +46,13 @@ static void bw_flush(BitW *w) {
 typedef struct { const uint8_t *buf; size_t len, pos; uint64_t acc; int n; } BitR;
 static inline uint32_t br_get(BitR *r, int nb) {  // nb <= 32
     if (r->n < nb) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         if (r->pos + 8 <= r->len) {   // branch-light refill: load 8 bytes, keep whole bytes that fit
             uint64_t w; memcpy(&w, r->buf + r->pos, 8);   // little-endian hosts
             r->acc |= w << r->n; r->pos += (63 - r->n) >> 3; r->n |= 56;
-        } else while (r->n < nb) { r->acc |= (uint64_t)(r->pos < r->len ? r->buf[r->pos] : 0) << r->n; r->pos++; r->n += 8; }
+        } else
+#endif
+        while (r->n < nb) { r->acc |= (uint64_t)(r->pos < r->len ? r->buf[r->pos] : 0) << r->n; r->pos++; r->n += 8; }
     }
     uint32_t v = (uint32_t)(r->acc & ((1ull << nb) - 1));
     r->acc >>= nb; r->n -= nb;
@@ -288,14 +291,16 @@ static void cov_sums(const int32_t *I, const int32_t *Q, int64_t s, int64_t e, i
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define IQC_X86 1
 #include <immintrin.h>
+static int avx512vnni_ok;
+static void detect_avx512vnni(void) {
+    __builtin_cpu_init();
+    avx512vnni_ok = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+                    __builtin_cpu_supports("avx512vnni") && !getenv("IQC_NO_SIMD");
+}
 static int have_avx512vnni(void) {
-    static int v = -1;
-    if (v < 0) {
-        __builtin_cpu_init();
-        v = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vnni")
-            && !getenv("IQC_NO_SIMD");
-    }
-    return v;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, detect_avx512vnni);
+    return avx512vnni_ok;
 }
 // Same sums from int16 (I, Q) pairs with vpdpwssd: (I,Q).(I',Q') = s0+s3, (I,Q).(Q',I') = s1+s2, and with Q
 // negated the differences. Needs |z| <= 2^13: each step adds < 2^27 per int32 lane, flushed to int64 every 8.
@@ -382,13 +387,14 @@ static void block_residuals(const int32_t *I, const int32_t *Q, int64_t s, int64
 }
 // Residuals for a block: SIMD on the interleaved int16 array when available (int16 coefficients are
 // guaranteed by quantize()), otherwise the portable version on the planar copies.
-static void residuals(int simd, const int16_t *z, const int32_t *I, const int32_t *Q, int64_t s, int64_t e, int K,
+// I, Q: planar copies whose index 0 is sample `base` (valid from index -K).
+static void residuals(int simd, const int16_t *z, const int32_t *I, const int32_t *Q, int64_t base, int64_t s, int64_t e, int K,
                       const int32_t *q, int sh, int hmin, int hmax, int32_t *rI, int32_t *rQ, int tstep) {
 #if IQC_X86
     if (simd) { block_residuals_avx512(z, s, e, K, q, sh, hmin, hmax, rI, rQ, tstep); return; }
 #endif
     (void)simd; (void)z;
-    block_residuals(I, Q, s, e, K, q, sh, hmin, hmax, rI, rQ, tstep);
+    block_residuals(I, Q, s - base, e - base, K, q, sh, hmin, hmax, rI, rQ, tstep);
 }
 // Least squares for block [s,e) of padded int32 history z: I_t on lags, Q_t on lags + I_t. Normal equations
 // from the sums S plus the shift structure C_{i,j} = C_{i-1,j-1} + edge terms.
@@ -484,12 +490,28 @@ static inline int ctx_Q(uint32_t aI, uint32_t aQ) { int c = qlog(aQ + aI / 2); r
 static void put_u32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
 static uint32_t get_u32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
+// fc32 -> int16 the way the encoder does it: x * scale, NaN -> 0, clamp, round half to even (like rint).
+static inline int32_t quant(float x, float scale) {
+    float v = x * scale;
+    v = v == v ? v : 0; v = v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v;
+    return (int32_t)((v + 12582912.0f) - 12582912.0f);   // exact for |v| < 2^22
+}
+void iqc_quantize(const float *x, int64_t nvals, float scale, float *out) {
+    float inv = 1.0f / scale;
+    for (int64_t i = 0; i < nvals; i++) out[i] = (float)quant(x[i], scale) * inv;
+}
+static int bad_params(int fmt, int64_t n, float scale, int shift, int K, int BL) {
+    return (fmt != IQC_FC32 && fmt != IQC_SC16) || n < 0 || n > IQC_MAX_N || !(scale > 0) || !(1.0f / scale > 0) ||
+           !(scale < 1e30f) || shift < 0 || shift > 3 || K < 1 || K > 32 || BL < 1 || BL > (1 << 20);
+}
+
 // ---------------- chunk codec ----------------
 // Layout: [u32 side][u32 low][u32 raw][u32 rans] + sections.
 // side: per-chunk symbol tables, then per superblock: split bits, then per LPC block: shift, I coefs, Q coefs.
 int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, int K, int BL, int prec,
                    uint8_t *out, int64_t cap, int64_t *inexact) {
     const float *x = in; const int16_t *x16 = in;
+    if (bad_params(fmt, n, scale, shift, K, BL) || prec < 1 || prec > 15) return -1;
     float inv = 1.0f / scale;
     int64_t nbad = 0;
     int M = 1 << shift, lmask = M - 1, hmax = 32767 >> shift, hmin = -32768 >> shift, nc = 4 * K + 1;
@@ -499,9 +521,10 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     int32_t zmax = 0;
     uint8_t *l = malloc(2 * n + 1), *sym = malloc(2 * n + 1), *ctx = malloc(2 * n + 1), *nraw = malloc(2 * n + 1);
     uint16_t *raw = malloc((2 * n + 1) * sizeof(uint16_t));
-    size_t caps[4] = {(size_t)n / 2 + 65536, (size_t)n + 4096, (size_t)n * 4 + 64, (size_t)n * 5 + 64};
-    uint8_t *sec[4]; for (int i = 0; i < 4; i++) sec[i] = malloc(caps[i]);
     int nb = (int)((n + BL - 1) / BL);   // leaves (upper bound on LPC blocks)
+    // side: tables (< 26 KB) + per block <= 11 + nc * 16 bits + 3 split bits per superblock
+    size_t caps[4] = {(size_t)nb * (nc * 16 + 14) / 8 + 65536, (size_t)n + 4096, (size_t)n * 4 + 64, (size_t)n * 5 + 64};
+    uint8_t *sec[4]; for (int i = 0; i < 4; i++) sec[i] = malloc(caps[i]);
     int32_t *cq = malloc(sizeof(int32_t) * (size_t)nb * nc);
     int *csh = malloc(sizeof(int) * nb), cand_sh[7];
     uint8_t *sbits = malloc((size_t)nb / 4 + 2);
@@ -519,9 +542,7 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
         int32_t q;
         if (fmt == IQC_SC16) q = x16[i];
         else {
-            float v = x[i] * scale;
-            v = v == v ? v : 0; v = v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v;
-            q = (int32_t)((v + 12582912.0f) - 12582912.0f);   // round half to even (|v| < 2^22), like rint
+            q = quant(x[i], scale);
             float back = (float)q * inv;   // what the decoder will produce
             nbad += memcmp(&back, &x[i], sizeof back) != 0;
         }
@@ -576,14 +597,14 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     for (int64_t S0 = 0; S0 < n; S0 += 4 * (int64_t)BL) {
         int64_t lb[5];
         for (int i = 0; i <= 4; i++) lb[i] = S0 + i * (int64_t)BL < n ? S0 + i * (int64_t)BL : n;
-        int32_t *Ip = plI + K - S0, *Qp = plQ + K - S0;   // planar copies indexed by t, for [S0 - K, lb[4])
+        int32_t *Ip = plI + K, *Qp = plQ + K;   // planar copies: index t - S0, valid for t in [S0 - K, lb[4])
         if (!simd_cov)
-            for (int64_t t = S0 - K; t < lb[4]; t++) { Ip[t] = zp[2 * t]; Qp[t] = zp[2 * t + 1]; }
+            for (int64_t t = S0 - K; t < lb[4]; t++) { Ip[t - S0] = zp[2 * t]; Qp[t - S0] = zp[2 * t + 1]; }
         for (int i = 0; i < 4; i++) {
 #if IQC_X86
             if (simd_cov) { cov_sums_avx512(zp, lb[i], lb[i + 1], K, LS[i]); continue; }
 #endif
-            cov_sums(Ip, Qp, lb[i], lb[i + 1], K, LS[i]);
+            cov_sums(Ip, Qp, lb[i] - S0, lb[i + 1] - S0, K, LS[i]);
         }
         // candidates: 0 = whole, 1-2 = halves, 3-6 = leaves
         static const int cl[7] = {0, 0, 2, 0, 1, 2, 3}, cr[7] = {4, 2, 4, 1, 2, 3, 4};
@@ -598,7 +619,7 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
             solve_ls(zp, s, e, K, Ssum, cf);
             int32_t *q = cand_q + (size_t)c * nc;
             int sh = cand_sh[c] = quantize(cf, nc, prec, hmax + 1, q);
-            residuals(simd, zp, Ip, Qp, s, e, K, q, sh, hmin, hmax, tmpI, tmpQ, 8);
+            residuals(simd, zp, Ip, Qp, S0, s, e, K, q, sh, hmin, hmax, tmpI, tmpQ, 8);
             double sI = 0, sQ = 0, cnt_t = 0;
             for (int64_t t0 = 0; t0 < e - s; t0 += 8 * RTILE)
                 for (int64_t t = t0; t < t0 + RTILE && t < e - s; t++) { sI += tmpI[t] < 0 ? -tmpI[t] : tmpI[t]; sQ += tmpQ[t] < 0 ? -tmpQ[t] : tmpQ[t]; cnt_t++; }
@@ -621,7 +642,7 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
             if (e <= s) continue;
             memcpy(cq + (size_t)nblk * nc, cand_q + (size_t)c * nc, nc * sizeof(int32_t)); csh[nblk++] = cand_sh[c];
             int32_t *crI = tmpI, *crQ = tmpQ;
-            residuals(simd, zp, Ip, Qp, s, e, K, cand_q + (size_t)c * nc, cand_sh[c], hmin, hmax, crI, crQ, 1);
+            residuals(simd, zp, Ip, Qp, S0, s, e, K, cand_q + (size_t)c * nc, cand_sh[c], hmin, hmax, crI, crQ, 1);
             for (int64_t t = s; t < e; t++) {
                 int rI = crI[t - s], rQ = crQ[t - s], nr;
                 uint32_t r32, mI = rI < 0 ? -rI : rI, mQ = rQ < 0 ? -rQ : rQ;
@@ -665,7 +686,11 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
         const EncSym *e = &es[((i & 1) * NCTX + ctx[i]) * NSYM + sym[i]];
         uint32_t xv = xs[i & 1];
         if (xv >= e->x_max) { PUTW(xv & 0xFFFF); xv >>= 16; }
+#ifdef __SIZEOF_INT128__
         uint32_t qt = e->rcp ? (uint32_t)(((unsigned __int128)xv * e->rcp) >> 64) : xv;
+#else
+        uint32_t qt = xv / e->freq;
+#endif
         xs[i & 1] = (qt << PROB_BITS) + (xv - qt * e->freq) + e->start;
     }
     PUTW(xs[1] >> 16); PUTW(xs[1] & 0xFFFF); PUTW(xs[0] >> 16); PUTW(xs[0] & 0xFFFF);
@@ -697,6 +722,7 @@ typedef struct {
     int shift, M, lmask, hmin, hmax;
     float inv;
     int f32;   // output fc32 (else sc16)
+    int err;   // corrupt stream detected
 } DecSt;
 
 #define ALWAYS_INLINE static inline __attribute__((always_inline))
@@ -735,6 +761,13 @@ ALWAYS_INLINE void dec_res(DecSt *d, int *rI, int *rQ) {   // residuals never de
     d->aI = d->aI - (d->aI >> 3) + (mI << 1); d->aQ = d->aQ - (d->aQ >> 3) + (mQ << 1);
 }
 
+// A valid stream reproduces values inside [hmin, hmax]; anything else is corruption. Stopping there keeps
+// every later FIR sum within int32 and the SIMD and portable paths in agreement.
+ALWAYS_INLINE int out_of_range(DecSt *d, int v) {
+    if ((unsigned)(v - d->hmin) <= (unsigned)(d->hmax - d->hmin)) return 0;
+    d->err = 1;
+    return 1;
+}
 // Direct-form FIR over the interleaved history (any platform).
 ALWAYS_INLINE void dec_out(const DecSt *d, void *out, int64_t i, int v) {
     if (d->f32) ((float *)out)[i] = (float)v * d->inv; else ((int16_t *)out)[i] = (int16_t)v;
@@ -748,8 +781,10 @@ static void dec_block_generic(DecSt *d, int32_t *zp, int64_t b0, int64_t b1, con
         dec_res(d, &rI, &rQ);
         const int32_t *h = zp + 2 * (t - K);
         int vI = clampi((fir(wI, h, 2 * K) + rnd) >> sh, d->hmin, d->hmax) + rI;
+        if (out_of_range(d, vI)) return;
         zp[2 * t] = vI;
         int vQ = clampi((fir(wQ, h, 2 * K) + wQ[2 * K] * vI + rnd) >> sh, d->hmin, d->hmax) + rQ;
+        if (out_of_range(d, vQ)) return;
         zp[2 * t + 1] = vQ;
         dec_out(d, out, 2 * t, vI * d->M + lo[0]);
         dec_out(d, out, 2 * t + 1, vQ * d->M + lo[1]);
@@ -782,7 +817,9 @@ static void dec_block_avx512(DecSt *d, int32_t *zp, int64_t b0, int64_t b1, cons
         if (d->shift) dec_low(d, lo);
         dec_res(d, &rI, &rQ);
         int vI = clampi((_mm_cvtsi128_si32(_mm512_castsi512_si128(PI0)) + rnd) >> sh, d->hmin, d->hmax) + rI;
+        if (out_of_range(d, vI)) return;
         int vQ = clampi((_mm_cvtsi128_si32(_mm512_castsi512_si128(PQ0)) + c0 * vI + rnd) >> sh, d->hmin, d->hmax) + rQ;
+        if (out_of_range(d, vQ)) return;
         zp[2 * t] = vI; zp[2 * t + 1] = vQ;
         dec_out(d, out, 2 * t, vI * d->M + lo[0]);
         dec_out(d, out, 2 * t + 1, vQ * d->M + lo[1]);
@@ -796,7 +833,7 @@ static void dec_block_avx512(DecSt *d, int32_t *zp, int64_t b0, int64_t b1, cons
 #endif
 
 int iqc_decode(const uint8_t *in, int64_t len, void *out, int fmt, int64_t n, float scale, int shift, int K, int BL) {
-    if (len < 16 || K < 1 || K > 32) return -1;
+    if (len < 16 || bad_params(fmt, n, scale, shift, K, BL)) return -1;
     size_t lens[4], off = 16;
     for (int i = 0; i < 4; i++) lens[i] = get_u32(in + 4 * i);
     if (16 + lens[0] + lens[1] + lens[2] + lens[3] > (size_t)len || lens[3] < 8) return -1;
@@ -820,7 +857,7 @@ int iqc_decode(const uint8_t *in, int64_t len, void *out, int fmt, int64_t n, fl
         int st = 0;
         for (int sy = 0; sy < NSYM; sy++) {
             uint32_t f = gamma_get(&side) - 1;
-            if (st + f > PROB_SCALE) goto done;
+            if (f > (uint32_t)(PROB_SCALE - st)) goto done;   // (st + f could wrap around in 32 bits)
             t->freq[sy] = (uint16_t)f; t->start[sy] = (uint16_t)st;
             memset(d->lut[ch][c] + st, sy, f); st += f;
         }
@@ -842,12 +879,16 @@ int iqc_decode(const uint8_t *in, int64_t len, void *out, int fmt, int64_t n, fl
             if (b1 <= b0) continue;
             int sh = br_get(&side, 5);
             coefs_get(&side, q, nc);
+            // what quantize() guarantees: int16 coefficients and |FIR sum| < 2^30 for in-range history
+            int64_t l1 = 0;
+            for (int j = 0; j < nc; j++) { if (q[j] < -32767 || q[j] > 32767) goto done; l1 += q[j] < 0 ? -q[j] : q[j]; }
+            if (sh > 30 || l1 * (d->hmax + 1) >= (1ll << 30)) goto done;
 #if IQC_X86
-            int fits = 1;
-            for (int j = 0; j < nc; j++) fits &= q[j] >= -32768 && q[j] <= 32767;
-            if (fits && have_avx512vnni()) { dec_block_avx512(d, zp, b0, b1, q, K, sh, out); continue; }
+            if (have_avx512vnni()) dec_block_avx512(d, zp, b0, b1, q, K, sh, out);
+            else
 #endif
             dec_block_generic(d, zp, b0, b1, q, K, sh, out);
+            if (d->err) goto done;
         }
     }
     ret = 0;

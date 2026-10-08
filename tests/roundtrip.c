@@ -58,6 +58,51 @@ static int check(const char *name, const int16_t *x, int64_t n) {
     return ok;
 }
 
+// Corrupt or crafted chunks must be rejected or decoded without memory errors (run under ASan/UBSan in CI).
+static int robustness(void) {
+    int ok = 1;
+    {   // table frequency that wraps around 32 bits (used to overflow the decoder's lookup table)
+        uint8_t b[64] = {0}; int bp = 0;
+#define BIT(v) do { if (v) b[16 + bp / 8] |= 1 << (bp % 8); bp++; } while (0)
+        BIT(1); BIT(0); BIT(1); BIT(1);
+        for (int i = 0; i < 31; i++) BIT(0);
+        BIT(1);
+        for (int i = 0; i < 31; i++) BIT(1);
+#undef BIT
+        uint32_t lens[4] = {(uint32_t)(bp + 7) / 8, 0, 0, 8};
+        for (int i = 0; i < 4; i++) for (int k = 0; k < 4; k++) b[4 * i + k] = (uint8_t)(lens[i] >> (8 * k));
+        int16_t out[2];
+        ok &= iqc_decode(b, 16 + lens[0] + 8, out, IQC_SC16, 1, 32767.f, 0, 24, 8192) == -1;
+    }
+    int64_t n = 20000, cap = n * 8 + (1 << 20), inexact;
+    int16_t *x = malloc(n * 4), *y = malloc(n * 4);
+    uint8_t *buf = malloc(cap), *mut = malloc(cap);
+    make(5, x, n);
+    int64_t sz = iqc_encode(x, IQC_SC16, n, 32767.f, 2, 24, 8192, 11, buf, cap, &inexact);
+    for (int it = 0; it < 3000; it++) {   // mutated valid chunks, then random bytes
+        int64_t len = sz;
+        if (it < 2000) { memcpy(mut, buf, sz); for (int k = 1 + rnd() % 4; k--;) mut[rnd() % sz] ^= (uint8_t)(1 + rnd() % 255); }
+        else { len = 16 + rnd() % 4096; for (int64_t i = 0; i < len; i++) mut[i] = (uint8_t)rnd(); }
+        int r = iqc_decode(mut, len, y, IQC_SC16, n, 32767.f, rnd() % 4, 24, 8192);
+        ok &= r == 0 || r == -1;
+    }
+    // invalid parameters are rejected, never undefined behaviour
+    ok &= iqc_encode(x, IQC_SC16, n, 32767.f, 4, 24, 8192, 11, buf, cap, &inexact) == -1;
+    ok &= iqc_encode(x, IQC_SC16, n, 32767.f, 2, 0, 8192, 11, buf, cap, &inexact) == -1;
+    ok &= iqc_encode(x, IQC_SC16, n, 32767.f, 2, 33, 8192, 11, buf, cap, &inexact) == -1;
+    ok &= iqc_encode(x, IQC_SC16, n, 32767.f, 2, 24, 0, 11, buf, cap, &inexact) == -1;
+    ok &= iqc_encode(x, IQC_SC16, -1, 32767.f, 2, 24, 8192, 11, buf, cap, &inexact) == -1;
+    ok &= iqc_decode(buf, sz, y, IQC_SC16, n, 32767.f, 9, 24, 8192) == -1;
+    ok &= iqc_decode(buf, sz, y, IQC_SC16, n, 32767.f, 2, 24, 0) == -1;
+    // tiny leaf blocks (lots of side information) still encode and round-trip
+    make(0, x, n);
+    sz = iqc_encode(x, IQC_SC16, n, 32767.f, 0, 32, 16, 11, buf, cap, &inexact);
+    ok &= sz > 0 && sz <= cap && !iqc_decode(buf, sz, y, IQC_SC16, n, 32767.f, 0, 32, 16) && !memcmp(x, y, n * 4);
+    free(x); free(y); free(buf); free(mut);
+    printf("%s  corrupt input / parameters\n", ok ? "ok  " : "FAIL");
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "gen")) {
         int64_t n = atoll(argv[2]);
@@ -66,7 +111,9 @@ int main(int argc, char **argv) {
         make(5, x, n);
         for (int64_t i = 0; i < 2 * n; i++) f[i] = (float)x[i] * (1.0f / 32767.0f);
         FILE *o = fopen(argv[3], "wb");
-        return !o || fwrite(f, 8, n, o) != (size_t)n || fclose(o);
+        int bad = !o || fwrite(f, 8, n, o) != (size_t)n || fclose(o);
+        free(x); free(f);
+        return bad;
     }
     {   // CRC-32C: check value, and hardware / table paths against a bitwise reference on odd lengths
         uint8_t b[1027];
@@ -77,6 +124,7 @@ int main(int argc, char **argv) {
         printf("%s  crc32c\n", ok ? "ok  " : "FAIL");
         if (!ok) return 1;
     }
+    if (!robustness()) return 1;
     static const char *names[8] = {"white int16", "full-scale extremes", "zeros", "pure tone (ill-conditioned LPC)",
                                    "tone + 1-bit sigma-delta", "tone + 2-bit sigma-delta", "tone + 3-bit sigma-delta", "bursty noise"};
     static const int64_t lens[3] = {1, 7, 300001};

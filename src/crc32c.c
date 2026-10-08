@@ -34,8 +34,10 @@ __attribute__((target("sse4.2"))) static uint32_t crc_hw(uint32_t c, const uint8
     while (n--) c = _mm_crc32_u8(c, *p++);
     return c;
 }
-static int have_hw(void) { static int v = -1; if (v < 0) { __builtin_cpu_init(); v = __builtin_cpu_supports("sse4.2"); } return v; }
-#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+static int hw_ok;
+static void detect(void) { __builtin_cpu_init(); hw_ok = __builtin_cpu_supports("sse4.2"); }
+static int have_hw(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, detect); return hw_ok; }
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #include <arm_acle.h>
 static uint32_t crc_hw(uint32_t c, const uint8_t *p, size_t n) {
     for (; n >= 8; n -= 8, p += 8) { uint64_t v; memcpy(&v, p, 8); c = __crc32cd(c, v); }

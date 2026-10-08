@@ -2,7 +2,7 @@ CC      ?= cc
 CFLAGS  ?= -O3
 PREFIX  ?= /usr/local
 # -ffp-contract=off keeps the float -> int16 rounding identical to rint() (no fused multiply-add).
-ALL_CFLAGS = $(CFLAGS) -std=gnu11 -ffp-contract=off -Wall -Wextra
+ALL_CFLAGS = $(CFLAGS) -std=gnu11 -D_FILE_OFFSET_BITS=64 -ffp-contract=off -Wall -Wextra
 LDLIBS  = -lm -lpthread
 
 iqcodec: src/main.c src/iqc.c src/iqc.h src/crc32c.c src/crc32c.h

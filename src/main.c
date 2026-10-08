@@ -1,5 +1,8 @@
 // iqcodec command line: lossless compression of IQ capture files.
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -11,9 +14,8 @@
 #include "crc32c.h"
 #include "iqc.h"
 
-#define VERSION "0.2.0"
+#define VERSION "0.2.1"
 #define CHUNK (1 << 21)           // complex samples per independently coded chunk
-#define MAX_CHUNK (1 << 26)       // sanity bound when reading
 #define K_ORDER 24
 #define LEAF 8192
 #define PREC 11
@@ -39,8 +41,9 @@ static void usage(FILE *f) {
         "  -j N      threads (default: number of CPUs, at most 8)\n"
         "  -v        print statistics\n"
         "  -h, -V    help, version\n\n"
-        "OUTPUT is written to a temporary file and renamed when complete; an existing file is replaced\n"
-        "only on success. INPUT and OUTPUT must not be the same file.\n");
+        "A file OUTPUT is written to a temporary file and renamed when complete, so an existing file is\n"
+        "replaced only on success (stdout, pipes and devices receive data as it is decoded). INPUT and\n"
+        "OUTPUT must not be the same file. Options go before INPUT / OUTPUT.\n");
 }
 
 static void put32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
@@ -53,16 +56,27 @@ static size_t read_full(FILE *f, void *buf, size_t n) {
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 // ---------------- output: same-file guard, temporary file + rename ----------------
-static char tmp_path[4096];   // non-empty while a temporary output exists
+static char tmp_path[PATH_MAX + 32];   // non-empty while a temporary output exists
+static char dst_path[PATH_MAX];        // where the temporary file is renamed to
+
 static void on_signal(int sig) { if (tmp_path[0]) unlink(tmp_path); signal(sig, SIG_DFL); raise(sig); }
+// Cleans up on fatal signals, except those the caller ignores (nohup, background jobs).
+static void install_signal_handlers(void) {
+    static const int sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGXFSZ};
+    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) {
+        struct sigaction old;
+        if (sigaction(sigs[i], NULL, &old) == 0 && old.sa_handler != SIG_IGN) signal(sigs[i], on_signal);
+    }
+}
 
 static int same_file(const struct stat *a, const struct stat *b) { return a->st_dev == b->st_dev && a->st_ino == b->st_ino; }
 
-// Refuses when OUTPUT is the input (path, link or redirection); otherwise opens a temporary file next to a
-// regular-file OUTPUT (or OUTPUT itself for stdout / devices / FIFOs).
+// Refuses when OUTPUT is the input (path, link or redirection). A regular-file OUTPUT (through symlinks, which
+// are kept) is written to a temporary file next to it; stdout, devices, FIFOs and /dev, /proc paths in place.
 static FILE *open_output(const char *op, FILE *in) {
     struct stat si, so;
     int have_in = fstat(fileno(in), &si) == 0 && S_ISREG(si.st_mode);
+    if (!*op) { fprintf(stderr, "iqcodec: empty output path\n"); return NULL; }
     if (!strcmp(op, "-")) {
         if (have_in && fstat(STDOUT_FILENO, &so) == 0 && same_file(&si, &so)) {
             fprintf(stderr, "iqcodec: output is the input file\n");
@@ -72,31 +86,51 @@ static FILE *open_output(const char *op, FILE *in) {
     }
     int exists = stat(op, &so) == 0;
     if (exists && have_in && same_file(&si, &so)) { fprintf(stderr, "iqcodec: %s: output is the input file\n", op); return NULL; }
-    if (exists && !S_ISREG(so.st_mode)) {   // device, FIFO, ...: write in place
+    // the file actually written: symlinks are followed so they keep pointing at the new data
+    char *real = exists ? realpath(op, NULL) : NULL;
+    const char *dst = real ? real : op;
+    int in_place = (exists && !S_ISREG(so.st_mode)) || !strncmp(dst, "/dev/", 5) || !strncmp(dst, "/proc/", 6);
+    struct stat lo;
+    if (!exists && lstat(op, &lo) == 0) in_place = 1;   // dangling symlink: create its target in place
+    if (in_place || strlen(dst) >= sizeof dst_path) {
+        free(real);
         FILE *f = fopen(op, "wb");
         if (!f) fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno));
         return f;
     }
-    const char *slash = strrchr(op, '/');
-    int dl = slash ? (int)(slash - op) + 1 : 0;
-    if (snprintf(tmp_path, sizeof tmp_path, "%.*s.iqcodec-XXXXXX", dl, op) >= (int)sizeof tmp_path) {
-        fprintf(stderr, "iqcodec: %s: path too long\n", op); tmp_path[0] = 0; return NULL;
-    }
+    strcpy(dst_path, dst);
+    free(real);
+    const char *slash = strrchr(dst_path, '/');
+    int dl = slash ? (int)(slash - dst_path) + 1 : 0;
+    snprintf(tmp_path, sizeof tmp_path, "%.*s.iqcodec-XXXXXX", dl, dst_path);
     int fd = mkstemp(tmp_path);
     if (fd < 0) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); tmp_path[0] = 0; return NULL; }
     mode_t um = umask(0); umask(um);
-    fchmod(fd, exists ? so.st_mode & 07777 : 0666 & ~um);
+    (void)fchmod(fd, exists ? so.st_mode & 0777 : 0666 & ~um);   // no setuid/setgid carried over
     FILE *f = fdopen(fd, "wb");
-    if (!f) { close(fd); unlink(tmp_path); tmp_path[0] = 0; }
+    if (!f) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); close(fd); unlink(tmp_path); tmp_path[0] = 0; }
     return f;
 }
-// Closes OUTPUT; on success moves the temporary file into place, otherwise removes it.
+// Closes OUTPUT; on success syncs and moves the temporary file into place, otherwise removes it.
 static int close_output(FILE *out, const char *op, int ok) {
-    if (out == stdout) return fflush(out) == 0 && ok;
+    if (out == stdout) {
+        if (fflush(out) != 0) { if (ok) fprintf(stderr, "iqcodec: write error: %s\n", strerror(errno)); return 0; }
+        return ok;
+    }
+    if (ok && tmp_path[0] && (fflush(out) != 0 || fsync(fileno(out)) != 0)) {
+        fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); ok = 0;
+    }
     if (fclose(out) != 0) { if (ok) fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); ok = 0; }
     if (tmp_path[0]) {
-        if (ok && rename(tmp_path, op) != 0) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); ok = 0; }
+        if (ok && rename(tmp_path, dst_path) != 0) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); ok = 0; }
         if (!ok) unlink(tmp_path);
+        else {   // make the rename itself durable (best effort)
+            char dir[PATH_MAX];
+            const char *slash = strrchr(dst_path, '/');
+            snprintf(dir, sizeof dir, "%.*s", slash ? (int)(slash - dst_path) + 1 : 1, slash ? dst_path : ".");
+            int dfd = open(dir, O_RDONLY);
+            if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+        }
         tmp_path[0] = 0;
     }
     return ok;
@@ -108,6 +142,7 @@ typedef struct {
     void *raw; int64_t n;             // samples
     uint8_t *enc; int64_t size, cap;  // coded chunk
     void *chk;                        // decoded copy for -t
+    float *qnt;                       // quantized input of a lossy (-l) chunk
     uint32_t crc;                     // crc32c of the samples (stored / expected)
     int64_t inexact; int err;         // 1: coding failure, 2: checksum / verification mismatch
 } Job;
@@ -117,12 +152,19 @@ static size_t ssize_of(int fmt) { return fmt == IQC_FC32 ? 8 : 4; }
 static void *enc_job(void *p) {
     Job *j = p;
     size_t bytes = (size_t)j->n * ssize_of(j->fmt);
-    j->crc = crc32c(0, j->raw, bytes);
     j->size = iqc_encode(j->raw, j->fmt, j->n, j->scale, j->shift, K_ORDER, LEAF, PREC, j->enc, j->cap, &j->inexact);
     j->err = j->size < 0 || j->size > j->cap;
-    if (!j->err && j->verify && !j->inexact) {   // a lossy (-l) chunk cannot match its input
+    if (j->err) return NULL;
+    const void *expect = j->raw;   // what decoding must reproduce (and what the checksum covers)
+    if (j->inexact) {               // lossy chunk: its quantized values
+        if (!j->qnt && !(j->qnt = malloc(bytes ? bytes : 1))) { j->err = 1; return NULL; }
+        iqc_quantize(j->raw, 2 * j->n, j->scale, j->qnt);
+        expect = j->qnt;
+    }
+    j->crc = crc32c(0, expect, bytes);
+    if (j->verify) {
         if (iqc_decode(j->enc, j->size, j->chk, j->fmt, j->n, j->scale, j->shift, K_ORDER, LEAF)) j->err = 1;
-        else if (memcmp(j->chk, j->raw, bytes)) j->err = 2;
+        else if (memcmp(j->chk, expect, bytes)) j->err = 2;
     }
     return NULL;
 }
@@ -139,7 +181,7 @@ static void run_jobs(Job *jobs, int nj, void *(*fn)(void *)) {
     for (int i = 0; i < nj; i++) if (!started[i]) fn(&jobs[i]);   // job 0, and any thread that failed to start
     for (int i = 1; i < nj; i++) if (started[i]) pthread_join(th[i], NULL);
 }
-static void free_jobs(Job *jobs, int nth) { for (int i = 0; i < nth; i++) { free(jobs[i].raw); free(jobs[i].enc); free(jobs[i].chk); } }
+static void free_jobs(Job *jobs, int nth) { for (int i = 0; i < nth; i++) { free(jobs[i].raw); free(jobs[i].enc); free(jobs[i].chk); free(jobs[i].qnt); } }
 
 // Picks the number of low bits for the sigma-delta tracker by trial on a prefix.
 static int pick_shift(const void *raw, int fmt, int64_t n, float scale) {
@@ -248,11 +290,12 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose) {
                 uint64_t want = get32(t) | (uint64_t)get32(t + 4) << 32, have = tot;
                 for (int i = 0; i < nj; i++) have += jobs[i].n;
                 if (want != have) { fprintf(stderr, "iqcodec: sample count mismatch (%llu expected, %llu found)\n", (unsigned long long)want, (unsigned long long)have); goto fail; }
+                if (fgetc(in) != EOF) { fprintf(stderr, "iqcodec: unexpected data after the end of the stream\n"); goto fail; }
                 done = 1; break;
             }
             if (read_full(in, ch + 4, 12) != 12) goto trunc;
             uint32_t sz = get32(ch + 8);
-            if (n > MAX_CHUNK || ch[4] > 3 || sz > (uint64_t)n * 16 + (1 << 20)) goto corrupt;
+            if (n > CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto corrupt;
             Job *j = &jobs[nj];
             if (sz > j->cap) { free(j->enc); j->cap = sz; j->enc = malloc(sz); }
             if ((int64_t)n > rawcap[nj]) { free(j->raw); rawcap[nj] = n; j->raw = malloc((size_t)n * ssz); }
@@ -298,17 +341,33 @@ int main(int argc, char **argv) {
     int nth = ncpu < 1 ? 1 : ncpu > 8 ? 8 : (int)ncpu;
     float scale = 32767.0f;
     optind = 2;
-    while ((opt = getopt(argc, argv, "f:s:ltj:vhV")) != -1) {
+#ifdef __GLIBC__
+    const char *optstr = "+f:s:ltj:vhV";   // like BSD: options before operands only
+#else
+    const char *optstr = "f:s:ltj:vhV";
+#endif
+    char *end;
+    while ((opt = getopt(argc, argv, optstr)) != -1) {
         switch (opt) {
         case 'f':
             if (!strcmp(optarg, "fc32")) fmt = IQC_FC32;
             else if (!strcmp(optarg, "sc16")) fmt = IQC_SC16;
             else { fprintf(stderr, "iqcodec: unknown format %s\n", optarg); return 2; }
             break;
-        case 's': scale = strtof(optarg, NULL); if (!(scale > 0)) { fprintf(stderr, "iqcodec: bad scale\n"); return 2; } break;
+        case 's':
+            scale = strtof(optarg, &end);
+            if (*end || end == optarg || !(scale > 0) || !isfinite(scale) || !isfinite(1.0f / scale) || !(1.0f / scale > 0)) {
+                fprintf(stderr, "iqcodec: bad scale %s\n", optarg); return 2;
+            }
+            break;
         case 'l': lossy = 1; break;
         case 't': verify = 1; break;
-        case 'j': nth = atoi(optarg); nth = nth < 1 ? 1 : nth > 64 ? 64 : nth; break;
+        case 'j': {
+            long v = strtol(optarg, &end, 10);
+            if (*end || end == optarg || v < 1 || v > 64) { fprintf(stderr, "iqcodec: -j must be 1..64\n"); return 2; }
+            nth = (int)v;
+            break;
+        }
         case 'v': verbose = 1; break;
         case 'V': puts("iqcodec " VERSION); return 0;
         case 'h': usage(stdout); return 0;
@@ -324,7 +383,7 @@ int main(int argc, char **argv) {
         if (in != stdin) fclose(in);
         return rc;
     }
-    signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGHUP, on_signal);
+    install_signal_handlers();
     FILE *out = open_output(op, in);
     if (!out) { if (in != stdin) fclose(in); return 1; }
     int rc = cmd == CMD_D ? decompress(in, out, nth, verbose) : compress(in, out, fmt, scale, lossy, verify, nth, verbose);
