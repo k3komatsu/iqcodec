@@ -1,0 +1,71 @@
+# iqcodec
+
+Lossless compression for IQ captures from software-defined radios (e.g. USRP / UHD).
+
+It takes interleaved complex samples, either `sc16` (int16 I/Q) or `fc32` (float32 I/Q that are
+int16 / 32767, which is what UHD produces when it converts `sc16` to `fc32`). Decompression
+gives back the input bit for bit.
+
+On a 630.8 MB USRP `fc32` capture (78.8 M samples):
+
+| codec | size | of original | single-thread time vs FLAC (compress / decompress) |
+|---|---|---|---|
+| zlib | 145.7 MB | 23.1 % | |
+| FLAC (int16, stereo) | 135.1 MB | 21.4 % | 1.0 / 1.0 |
+| **iqcodec** | **81.2 MB** | **12.9 %** | ~1.4 / ~1.3 (Ryzen 9 9950X) |
+
+## Install
+
+```sh
+brew install k3komatsu/tap/iqcodec
+```
+
+or build from source (C11, no dependencies):
+
+```sh
+make && make test && make install PREFIX=/usr/local
+```
+
+## Usage
+
+```sh
+iqcodec c capture.dat capture.iqc        # compress (fc32 input)
+iqcodec d capture.iqc capture.dat        # decompress
+iqcodec c -f sc16 capture.sc16 out.iqc   # int16 input
+uhd_rx_cfile ... | iqcodec c - out.iqc   # stdin / stdout with -
+```
+
+| option | |
+|---|---|
+| `-f fc32\|sc16` | input sample format (compress) |
+| `-s SCALE` | fc32 values are int16 / SCALE (default 32767) |
+| `-l` | allow fc32 input that is not exactly int16 / SCALE (it gets quantized; otherwise iqcodec refuses) |
+| `-j N` | threads (default: CPUs, at most 8); chunks are coded independently |
+| `-v` | statistics |
+
+## How it works
+
+Per chunk of 2^21 samples:
+
+- **Low bits.** USRP DC-offset correction leaves a first-order error-diffusion (sigma-delta) pattern in
+  the low bits. Its cumulative sum is a digital straight line, tracked with Debled-Rennesson's arithmetic
+  recognition. Deterministic steps cost nothing, ambiguous steps cost about a bit, and breaks are gap-coded.
+  The number of low bits (0-3) is chosen by trial.
+- **Prediction.** Widely-linear (joint I/Q) LPC of order 24, fitted by the encoder per block of 8192-32768
+  samples (block length chosen per superblock). The integer coefficients are stored, so the decoder only
+  runs an integer FIR.
+- **Residuals.** Magnitude class plus 2 mantissa bits are rANS-coded with per-chunk static tables. The
+  context is the recent residual magnitude. Remaining mantissa bits and the sign are stored raw.
+
+The decoder is integer-only, so streams are identical across platforms. On x86-64, AVX-512 VNNI paths are
+selected at run time (`IQC_NO_SIMD=1` disables them).
+
+## Limitations
+
+- fc32 input must be int16 / SCALE to be lossless. `-0.0` and NaN do not occur in UHD output and are not
+  preserved (`-l` maps them to 0).
+- Samples are complex pairs. sc8/sc12 data can be widened to sc16 first.
+
+## License
+
+MIT

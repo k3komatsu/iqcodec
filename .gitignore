@@ -1,0 +1,5 @@
+iqcodec
+tests/roundtrip
+*.o
+*.dat
+*.iqc
