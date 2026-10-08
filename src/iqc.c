@@ -501,8 +501,9 @@ void iqc_quantize(const float *x, int64_t nvals, float scale, float *out) {
     for (int64_t i = 0; i < nvals; i++) out[i] = (float)quant(x[i], scale) * inv;
 }
 static int bad_params(int fmt, int64_t n, float scale, int shift, int K, int BL) {
-    return (fmt != IQC_FC32 && fmt != IQC_SC16) || n < 0 || n > IQC_MAX_N || !(scale > 0) || !(1.0f / scale > 0) ||
-           !(scale < 1e30f) || shift < 0 || shift > 3 || K < 1 || K > 32 || BL < 1 || BL > (1 << 20);
+    return (fmt != IQC_FC32 && fmt != IQC_SC16) || n < 0 || n > IQC_MAX_N ||
+           (fmt == IQC_FC32 && (!(scale > 0) || !(1.0f / scale > 0) || !(scale < 1e30f))) ||   // scale unused for sc16
+           shift < 0 || shift > 3 || K < 1 || K > 32 || BL < 1 || BL > (1 << 20);
 }
 
 // ---------------- chunk codec ----------------
@@ -511,6 +512,7 @@ static int bad_params(int fmt, int64_t n, float scale, int shift, int K, int BL)
 int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, int K, int BL, int prec,
                    uint8_t *out, int64_t cap, int64_t *inexact) {
     const float *x = in; const int16_t *x16 = in;
+    if (inexact) *inexact = 0;
     if (bad_params(fmt, n, scale, shift, K, BL) || prec < 1 || prec > 15) return -1;
     float inv = 1.0f / scale;
     int64_t nbad = 0;

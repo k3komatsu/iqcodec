@@ -57,7 +57,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 
 // ---------------- output: same-file guard, temporary file + rename ----------------
 static char tmp_path[PATH_MAX + 32];   // non-empty while a temporary output exists
-static char dst_path[PATH_MAX];        // where the temporary file is renamed to
+static char dst_path[PATH_MAX];        // regular-file OUTPUT after following symlinks (rename target)
 
 static void on_signal(int sig) { if (tmp_path[0]) unlink(tmp_path); signal(sig, SIG_DFL); raise(sig); }
 // Cleans up on fatal signals, except those the caller ignores (nohup, background jobs).
@@ -71,40 +71,75 @@ static void install_signal_handlers(void) {
 
 static int same_file(const struct stat *a, const struct stat *b) { return a->st_dev == b->st_dev && a->st_ino == b->st_ino; }
 
-// Refuses when OUTPUT is the input (path, link or redirection). A regular-file OUTPUT (through symlinks, which
-// are kept) is written to a temporary file next to it; stdout, devices, FIFOs and /dev, /proc paths in place.
+// Descriptor behind /dev/stdout, /dev/stderr, /dev/fd/N or /proc/self/fd/N, else -1.
+static int fd_alias(const char *p) {
+    if (!strcmp(p, "/dev/stdout")) return STDOUT_FILENO;
+    if (!strcmp(p, "/dev/stderr")) return STDERR_FILENO;
+    const char *d = !strncmp(p, "/dev/fd/", 8) ? p + 8 : !strncmp(p, "/proc/self/fd/", 14) ? p + 14 : NULL;
+    if (!d || !*d) return -1;
+    char *end;
+    long v = strtol(d, &end, 10);
+    return *end || v < 0 || v > INT_MAX ? -1 : (int)v;
+}
+// Follows OUTPUT's symlinks one level at a time (relative targets against the link's directory) and stops
+// at a descriptor alias (*fd >= 0) or at a path that is not a symlink (stored in out; it may not exist).
+static int resolve_output(const char *op, char *out, size_t cap, int *fd) {
+    char cur[PATH_MAX], tgt[PATH_MAX], nxt[PATH_MAX];
+    if (snprintf(cur, sizeof cur, "%s", op) >= (int)sizeof cur) { errno = ENAMETOOLONG; return -1; }
+    for (int i = 0; i < 40; i++) {
+        struct stat lo;
+        if ((*fd = fd_alias(cur)) >= 0) return 0;
+        if (lstat(cur, &lo) != 0 || !S_ISLNK(lo.st_mode)) {
+            if (snprintf(out, cap, "%s", cur) >= (int)cap) { errno = ENAMETOOLONG; return -1; }
+            return 0;
+        }
+        ssize_t k = readlink(cur, tgt, sizeof tgt - 1);
+        if (k < 0) return -1;
+        tgt[k] = 0;
+        const char *slash = strrchr(cur, '/');
+        int dl = tgt[0] == '/' || !slash ? 0 : (int)(slash - cur) + 1;
+        if (snprintf(nxt, sizeof nxt, "%.*s%s", dl, cur, tgt) >= (int)sizeof nxt) { errno = ENAMETOOLONG; return -1; }
+        memcpy(cur, nxt, sizeof cur);
+    }
+    errno = ELOOP;
+    return -1;
+}
+
+// Refuses when OUTPUT is the input (path, link or redirection). A regular-file OUTPUT (reached through any
+// symlinks, which are kept) is written to a temporary file next to it and renamed on success. stdout and
+// descriptor aliases (/dev/stdout, /dev/fd/N, ...) are written through the existing descriptor (so >> still
+// appends); devices and FIFOs are opened in place.
 static FILE *open_output(const char *op, FILE *in) {
     struct stat si, so;
-    int have_in = fstat(fileno(in), &si) == 0 && S_ISREG(si.st_mode);
+    int have_in = fstat(fileno(in), &si) == 0 && S_ISREG(si.st_mode), afd = -1;
     if (!*op) { fprintf(stderr, "iqcodec: empty output path\n"); return NULL; }
-    if (!strcmp(op, "-")) {
-        if (have_in && fstat(STDOUT_FILENO, &so) == 0 && same_file(&si, &so)) {
-            fprintf(stderr, "iqcodec: output is the input file\n");
-            return NULL;
-        }
-        return stdout;
+    if (!strcmp(op, "-")) afd = STDOUT_FILENO;
+    else if (resolve_output(op, dst_path, sizeof dst_path, &afd) != 0) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); return NULL; }
+    if (afd >= 0) {
+        if (fstat(afd, &so) != 0) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); return NULL; }
+        if (have_in && same_file(&si, &so)) { fprintf(stderr, "iqcodec: %s: output is the input file\n", op); return NULL; }
+        if (afd == STDOUT_FILENO) return stdout;
+        int nfd = dup(afd);
+        FILE *f = nfd >= 0 ? fdopen(nfd, "wb") : NULL;   // fdopen never truncates
+        if (!f) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); if (nfd >= 0) close(nfd); }
+        return f;
     }
-    int exists = stat(op, &so) == 0;
+    int exists = stat(dst_path, &so) == 0;
     if (exists && have_in && same_file(&si, &so)) { fprintf(stderr, "iqcodec: %s: output is the input file\n", op); return NULL; }
-    // the file actually written: symlinks are followed so they keep pointing at the new data
-    char *real = exists ? realpath(op, NULL) : NULL;
-    const char *dst = real ? real : op;
-    int in_place = (exists && !S_ISREG(so.st_mode)) || !strncmp(dst, "/dev/", 5) || !strncmp(dst, "/proc/", 6);
-    struct stat lo;
-    if (!exists && lstat(op, &lo) == 0) in_place = 1;   // dangling symlink: create its target in place
-    if (in_place || strlen(dst) >= sizeof dst_path) {
-        free(real);
-        FILE *f = fopen(op, "wb");
+    if (exists && !S_ISREG(so.st_mode)) {   // device, FIFO, ...
+        FILE *f = fopen(dst_path, "wb");
         if (!f) fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno));
         return f;
     }
-    strcpy(dst_path, dst);
-    free(real);
     const char *slash = strrchr(dst_path, '/');
     int dl = slash ? (int)(slash - dst_path) + 1 : 0;
     snprintf(tmp_path, sizeof tmp_path, "%.*s.iqcodec-XXXXXX", dl, dst_path);
     int fd = mkstemp(tmp_path);
-    if (fd < 0) { fprintf(stderr, "iqcodec: %s: %s\n", op, strerror(errno)); tmp_path[0] = 0; return NULL; }
+    if (fd < 0) {
+        fprintf(stderr, "iqcodec: %s: cannot create a temporary file in %.*s: %s\n", op, dl ? dl : 1, dl ? dst_path : ".", strerror(errno));
+        tmp_path[0] = 0;
+        return NULL;
+    }
     mode_t um = umask(0); umask(um);
     (void)fchmod(fd, exists ? so.st_mode & 0777 : 0666 & ~um);   // no setuid/setgid carried over
     FILE *f = fdopen(fd, "wb");
@@ -157,7 +192,7 @@ static void *enc_job(void *p) {
     if (j->err) return NULL;
     const void *expect = j->raw;   // what decoding must reproduce (and what the checksum covers)
     if (j->inexact) {               // lossy chunk: its quantized values
-        if (!j->qnt && !(j->qnt = malloc(bytes ? bytes : 1))) { j->err = 1; return NULL; }
+        if (!j->qnt && !(j->qnt = malloc((size_t)CHUNK * 8))) { j->err = 1; return NULL; }
         iqc_quantize(j->raw, 2 * j->n, j->scale, j->qnt);
         expect = j->qnt;
     }
@@ -291,6 +326,7 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose) {
                 for (int i = 0; i < nj; i++) have += jobs[i].n;
                 if (want != have) { fprintf(stderr, "iqcodec: sample count mismatch (%llu expected, %llu found)\n", (unsigned long long)want, (unsigned long long)have); goto fail; }
                 if (fgetc(in) != EOF) { fprintf(stderr, "iqcodec: unexpected data after the end of the stream\n"); goto fail; }
+                if (ferror(in)) { fprintf(stderr, "iqcodec: read error: %s\n", strerror(errno)); goto fail; }
                 done = 1; break;
             }
             if (read_full(in, ch + 4, 12) != 12) goto trunc;
@@ -356,7 +392,7 @@ int main(int argc, char **argv) {
             break;
         case 's':
             scale = strtof(optarg, &end);
-            if (*end || end == optarg || !(scale > 0) || !isfinite(scale) || !isfinite(1.0f / scale) || !(1.0f / scale > 0)) {
+            if (*end || end == optarg || !(scale > 0) || !(scale < 1e30f) || !(1.0f / scale > 0)) {   // library limits
                 fprintf(stderr, "iqcodec: bad scale %s\n", optarg); return 2;
             }
             break;

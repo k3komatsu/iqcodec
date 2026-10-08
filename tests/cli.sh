@@ -29,8 +29,17 @@ cmp "$T/b.out" "$T/b.sc16"
 "$BIN" c "$T/empty" "$T/e.iqc"
 "$BIN" d "$T/e.iqc" "$T/e.out"
 cmp "$T/e.out" "$T/empty"
-"$BIN" d "$T/a.iqc" /dev/stdout > "$T/s.out"                    # /dev paths are written in place
+"$BIN" d "$T/a.iqc" /dev/stdout > "$T/s.out"                    # descriptor aliases: written in place
 cmp "$T/s.out" "$T/a.fc32"
+echo HEAD > "$T/app.out"; cp "$T/app.out" "$T/app.ref"; cat "$T/b.sc16" >> "$T/app.ref"
+"$BIN" d "$T/b.iqc" /dev/stdout >> "$T/app.out"                  # ... and >> still appends
+cmp "$T/app.out" "$T/app.ref"
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then                       # regular files under /dev are files
+  S="/dev/shm/iqcodec-test-$$"; echo previous > "$S"
+  if "$BIN" c "$T/b.sc16" "$S" 2>/dev/null; then rm -f "$S"; fail "inexact fc32 accepted"; fi
+  test "$(cat "$S")" = previous || { rm -f "$S"; fail "/dev/shm output clobbered on failure"; }
+  rm -f "$S"
+fi
 
 # lossy (-l): output decodes and verifies (to the quantized values, which are then exact)
 "$BIN" c -l -t "$T/b.sc16" "$T/l.iqc"                           # sc16 bytes read as fc32: inexact
@@ -68,6 +77,11 @@ echo previous > "$T/old.iqc"
 must_fail "$BIN" c "$T/b.sc16" "$T/old.iqc"                     # inexact fc32: fails after opening OUTPUT
 test "$(cat "$T/old.iqc")" = previous || fail "existing output clobbered on failure"
 no_temp "failed run"
+ln -s nothere "$T/dang"                                           # dangling symlink: nothing created on failure
+must_fail "$BIN" d "$T/bad.iqc" "$T/dang"
+test ! -e "$T/nothere" || fail "dangling symlink target created by a failed run"
+"$BIN" d "$T/b.iqc" "$T/dang"
+cmp "$T/nothere" "$T/b.sc16"
 echo old > "$T/target"; ln -s "$T/target" "$T/out.lnk"            # writes go through a symlink OUTPUT
 "$BIN" d "$T/b.iqc" "$T/out.lnk"
 test -L "$T/out.lnk" || fail "symlink replaced"
