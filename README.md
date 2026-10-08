@@ -30,7 +30,9 @@ make && make test && make install PREFIX=/usr/local
 
 ```sh
 iqcodec c capture.dat capture.iqc        # compress (fc32 input)
-iqcodec d capture.iqc capture.dat        # decompress
+iqcodec c -t capture.dat capture.iqc     # ... and verify by decoding right away
+iqcodec d capture.iqc capture.dat        # decompress (checksums verified)
+iqcodec t capture.iqc                    # verify only, no output
 iqcodec c -f sc16 capture.sc16 out.iqc   # int16 input
 uhd_rx_cfile ... | iqcodec c - out.iqc   # stdin / stdout with -
 ```
@@ -40,8 +42,17 @@ uhd_rx_cfile ... | iqcodec c - out.iqc   # stdin / stdout with -
 | `-f fc32\|sc16` | input sample format (compress) |
 | `-s SCALE` | fc32 values are int16 / SCALE (default 32767) |
 | `-l` | allow fc32 input that is not exactly int16 / SCALE (it gets quantized; otherwise iqcodec refuses) |
+| `-t` | compress: decode each chunk after encoding and compare with the input |
 | `-j N` | threads (default: CPUs, at most 8); chunks are coded independently |
 | `-v` | statistics |
+
+Every chunk stores a CRC-32C of its samples, and the stream ends with the total sample count.
+`d` and `t` check both, so corruption or truncation is an error instead of wrong data.
+`c -t` also catches encoder faults before you delete the original.
+
+Output goes to a temporary file in the same directory and is renamed into place only on success, so a
+failed run never leaves partial output and never replaces an existing file. iqcodec refuses an output that
+is the input file, whether by the same path, a symbolic or hard link, or a shell redirection.
 
 ## How it works
 

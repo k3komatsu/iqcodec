@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "crc32c.h"
 #include "iqc.h"
 
 static uint64_t rs = 88172645463325252ull;
@@ -66,6 +67,15 @@ int main(int argc, char **argv) {
         for (int64_t i = 0; i < 2 * n; i++) f[i] = (float)x[i] * (1.0f / 32767.0f);
         FILE *o = fopen(argv[3], "wb");
         return !o || fwrite(f, 8, n, o) != (size_t)n || fclose(o);
+    }
+    {   // CRC-32C: check value, and hardware / table paths against a bitwise reference on odd lengths
+        uint8_t b[1027];
+        for (int i = 0; i < 1027; i++) b[i] = (uint8_t)rnd();
+        uint32_t ref = ~0u;
+        for (int i = 0; i < 1027; i++) { ref ^= b[i]; for (int k = 0; k < 8; k++) ref = ref & 1 ? (ref >> 1) ^ 0x82F63B78u : ref >> 1; }
+        int ok = crc32c(0, "123456789", 9) == 0xE3069283u && crc32c(0, b, 1027) == ~ref && crc32c(crc32c(0, b, 500), b + 500, 527) == ~ref;
+        printf("%s  crc32c\n", ok ? "ok  " : "FAIL");
+        if (!ok) return 1;
     }
     static const char *names[8] = {"white int16", "full-scale extremes", "zeros", "pure tone (ill-conditioned LPC)",
                                    "tone + 1-bit sigma-delta", "tone + 2-bit sigma-delta", "tone + 3-bit sigma-delta", "bursty noise"};
