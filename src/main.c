@@ -112,8 +112,8 @@ static void on_signal(int sig) {
         return;
     }
     struct stat ts;
-    if (tmp_path[0] && graceful_int && fstat(tmp_fd, &ts) == 0 && ts.st_size > 16) {   // a recording cannot be read
-        // again: leave what reached the file for d --salvage
+    int empty = tmp_fd >= 0 && fstat(tmp_fd, &ts) == 0 && ts.st_size <= 16;   // tmp_fd -1: being closed, keep it
+    if (tmp_path[0] && graceful_int && !empty) {   // a recording cannot be read again: leave it for d --salvage
         static const char m[] = "\niqcodec: partial recording kept in ";
         ssize_t r = write(STDERR_FILENO, m, sizeof m - 1);
         r = write(STDERR_FILENO, tmp_path, strlen(tmp_path)); r = write(STDERR_FILENO, "\n", 1); (void)r;
@@ -246,12 +246,13 @@ static int close_output(FILE *out, const char *op, int ok) {
     if (ok && tmp_path[0] && (fflush(out) != 0 || full_sync(fileno(out)) != 0)) {
         msg("%s: %s\n", op, strerror(errno)); ok = 0;
     }
+    tmp_fd = -1;   // its number may be reused below; on_signal must not fstat it
     if (fclose(out) != 0) { if (ok) msg("%s: %s\n", op, strerror(errno)); ok = 0; }
     if (tmp_path[0]) {
         if (ok && (no_replace ? rename_new(tmp_path, dst_path) : rename(tmp_path, dst_path)) != 0) { msg("%s: %s\n", op, strerror(errno)); ok = 0; }
         struct stat ts;
         if (!ok && graceful_int && stat(tmp_path, &ts) == 0 && ts.st_size > 16)   // see on_signal
-            msg("partial recording kept in %s (recover it with: iqcodec d --salvage)\n", tmp_path);
+            msg("recording kept in %s (recover it with: iqcodec d --salvage)\n", tmp_path);
         else if (!ok) unlink(tmp_path);
         else {   // make the rename itself durable (best effort)
             char dir[PATH_MAX];
