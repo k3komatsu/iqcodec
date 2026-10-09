@@ -10,6 +10,8 @@ sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 
 n=0
 while read -r sum name how opts; do
   case $sum in '#'*|'') continue ;; esac
+  [ -f "$name" ] || { echo "FAIL: $name is missing"; exit 1; }
+  "$BIN" t "$name" || { echo "FAIL: $name does not decode"; exit 1; }
   got=$("$BIN" d "$name" - | sha)
   [ "$got" = "$sum" ] || { echo "FAIL: $name decodes to different samples"; exit 1; }
   if [ "$how" = c ]; then
