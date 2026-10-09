@@ -1,6 +1,7 @@
 // iqcodec command line: lossless compression of IQ capture files.
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
@@ -24,7 +25,7 @@
 //   u32 nsamples (0 = end), u8 shift, 3 reserved bytes, u32 nbytes, u32 crc32c of the samples, payload
 // end marker: u32 0, u64 total samples. (Version 2; version 1 of iqcodec 0.1.0 is not supported.)
 static const char MAGIC[4] = {'I', 'Q', 'C', 'D'};
-enum { CMD_C, CMD_D, CMD_T };
+enum { CMD_C, CMD_D, CMD_T, CMD_I };
 
 static void usage(FILE *f) {
     fprintf(f,
@@ -32,6 +33,7 @@ static void usage(FILE *f) {
         "usage: iqcodec c [options] INPUT OUTPUT    compress\n"
         "       iqcodec d [options] INPUT OUTPUT    decompress (checksums verified)\n"
         "       iqcodec t [options] INPUT           test: decompress and verify checksums, no output\n"
+        "       iqcodec i INPUT                     info: format, samples, size (structure checked, data not decoded)\n"
         "       (use - for stdin / stdout)\n\n"
         "options:\n"
         "  -f FMT    input sample format for c: fc32 (complex float32, default) or sc16 (complex int16)\n"
@@ -40,6 +42,8 @@ static void usage(FILE *f) {
         "  -t        with c: decode every chunk right after encoding and compare with the input\n"
         "  -j N      threads (default: number of CPUs, at most 8)\n"
         "  -v        print statistics\n"
+        "  --skip N  with d / t: start at sample N (complex samples, counted from 0)\n"
+        "  --count N with d / t: at most N samples; only the chunks covering the range are read\n"
         "  -h, -V    help, version\n\n"
         "A file OUTPUT is written to a temporary file and renamed when complete, so an existing file is\n"
         "replaced only on success (stdout, pipes and devices receive data as it is decoded). INPUT and\n"
@@ -199,6 +203,7 @@ static int close_output(FILE *out, const char *op, int ok) {
 typedef struct {
     int fmt, shift, verify; float scale;
     void *raw; int64_t n;             // samples
+    uint64_t first;                   // d: index of the chunk's first sample in the stream
     uint8_t *enc; int64_t size, cap;  // coded chunk
     void *chk;                        // decoded copy for -t
     float *qnt;                       // quantized input of a lossy (-l) chunk
@@ -383,8 +388,10 @@ done:
     return rc;
 }
 
-// out == NULL: test only.
-static int decompress(FILE *in, FILE *out, int nth, int verbose) {
+// out == NULL: test only. Samples [skip, lim) only: chunks before skip are passed over (seeked when possible), and
+// reading stops at the first chunk past lim, so only the chunks that overlap the range are decoded and verified.
+// info: print what the headers say and decode nothing.
+static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, uint64_t lim, int info) {
     uint8_t hdr[16];
     if (read_full(in, hdr, 16) != 16 || memcmp(hdr, MAGIC, 4) || hdr[4] != 2 || hdr[5] > 1 || hdr[6] != K_ORDER || get32(hdr + 8) != LEAF) {
         fprintf(stderr, "iqcodec: not an iqcodec stream (or an unsupported version)\n");
@@ -394,16 +401,22 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose) {
     float scale; memcpy(&scale, hdr + 12, 4);
     size_t ssz = ssize_of(fmt);
     int ns = nth + 2, state[MAX_SLOTS] = {0}, nrun = 0, rc = 1, eof = 0;
+    uint64_t nchunks = 0, csize = 16 + 12;
+    if (info) skip = lim = UINT64_MAX;
     Job jobs[MAX_SLOTS];
     pthread_t th[MAX_TH];
     memset(jobs, 0, sizeof jobs);
     Pool pl = {jobs, state, ns, 0, 0, dec_job, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
     int64_t rawcap[MAX_SLOTS] = {0}, rd = 0, wr = 0;
     uint64_t tot = 0, have = 0;
+    static uint8_t skipbuf[1 << 16];
+    struct stat st;
+    int seekable = fstat(fileno(in), &st) == 0 && S_ISREG(st.st_mode);
     double t0 = now();
     nrun = pool_start(&pl, th, nth);
     if (!nrun) { fprintf(stderr, "iqcodec: cannot start threads\n"); goto fail; }
     while (!eof || wr < rd) {
+        if (!eof && have >= lim) eof = 1;
         if (!eof && rd - wr < ns) {
             uint8_t ch[16];
             if (read_full(in, ch, 4) != 4) goto trunc;
@@ -420,13 +433,23 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose) {
                 if (read_full(in, ch + 4, 12) != 12) goto trunc;
                 uint32_t sz = get32(ch + 8);
                 if (n > CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto corrupt;
+                nchunks++; csize += 16 + (uint64_t)sz;
+                if (have + n <= skip) {   // before the range
+                    have += n;
+                    if (seekable) { if (fseeko(in, sz, SEEK_CUR)) { fprintf(stderr, "iqcodec: seek error: %s\n", strerror(errno)); goto fail; } continue; }
+                    for (uint32_t left = sz, m; left; left -= m) {   // not seekable: read it
+                        m = left < sizeof skipbuf ? left : (uint32_t)sizeof skipbuf;
+                        if (read_full(in, skipbuf, m) != m) goto trunc;
+                    }
+                    continue;
+                }
                 int k = (int)(rd % ns);
                 Job *j = &jobs[k];
                 if (sz > j->cap) { free(j->enc); j->cap = sz; j->enc = malloc(sz); }
                 if ((int64_t)n > rawcap[k]) { free(j->raw); rawcap[k] = n; j->raw = malloc((size_t)n * ssz); }
                 if (!j->enc || !j->raw) { fprintf(stderr, "iqcodec: out of memory\n"); goto fail; }
                 if (read_full(in, j->enc, sz) != sz) goto trunc;
-                j->n = n; j->size = sz; j->shift = ch[4]; j->fmt = fmt; j->scale = scale; j->crc = get32(ch + 12);
+                j->n = n; j->size = sz; j->shift = ch[4]; j->fmt = fmt; j->scale = scale; j->crc = get32(ch + 12); j->first = have;
                 have += n;
                 set_state(&pl, k, S_READY); rd++;
                 if (rd - wr < ns && get_state(&pl, (int)(wr % ns)) != S_DONE) continue;   // keep reading ahead
@@ -438,11 +461,18 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose) {
         Job *j = &jobs[k];
         if (j->err == 2) { fprintf(stderr, "iqcodec: chunk %lld: checksum mismatch (corrupt data)\n", (long long)wr); goto fail; }
         if (j->err) { fprintf(stderr, "iqcodec: chunk %lld: corrupt data\n", (long long)wr); goto fail; }
-        if (out && fwrite(j->raw, ssz, j->n, out) != (size_t)j->n) { fprintf(stderr, "iqcodec: write error: %s\n", strerror(errno)); goto fail; }
-        tot += j->n;
+        uint64_t lo = skip > j->first ? skip - j->first : 0, hi = lim - j->first < (uint64_t)j->n ? lim - j->first : (uint64_t)j->n;
+        if (out && fwrite((char *)j->raw + lo * ssz, ssz, hi - lo, out) != hi - lo) { fprintf(stderr, "iqcodec: write error: %s\n", strerror(errno)); goto fail; }
+        tot += hi - lo;
         set_state(&pl, k, S_FREE); wr++;
     }
-    if (verbose)
+    if (info) {
+        printf("format   %s (int16 / %g)\nsamples  %llu (%llu bytes)\nchunks   %llu\nsize     %llu bytes (%.2f%%)\n",
+               fmt == IQC_FC32 ? "fc32" : "sc16", scale, (unsigned long long)have, (unsigned long long)(have * ssz),
+               (unsigned long long)nchunks, (unsigned long long)csize, have ? 100.0 * csize / (have * ssz) : 0);
+    } else if ((lim != UINT64_MAX && tot < lim - skip) || (have < skip && lim > skip))
+        fprintf(stderr, "iqcodec: the stream ends inside the requested range (%llu samples)\n", (unsigned long long)tot);
+    if (verbose && !info)
         fprintf(stderr, "%llu samples (%llu bytes) %s, %.2f s, checksums verified\n", (unsigned long long)tot,
                 (unsigned long long)(tot * ssz), out ? "written" : "OK", now() - t0);
     rc = 0;
@@ -462,8 +492,8 @@ done:
 int main(int argc, char **argv) {
     if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) { puts("iqcodec " VERSION); return 0; }
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) { usage(stdout); return 0; }
-    if (argc < 2 || strlen(argv[1]) != 1 || !strchr("cdt", argv[1][0])) { usage(stderr); return 2; }
-    int cmd = argv[1][0] == 'c' ? CMD_C : argv[1][0] == 'd' ? CMD_D : CMD_T;
+    if (argc < 2 || strlen(argv[1]) != 1 || !strchr("cdti", argv[1][0])) { usage(stderr); return 2; }
+    int cmd = argv[1][0] == 'c' ? CMD_C : argv[1][0] == 'd' ? CMD_D : argv[1][0] == 't' ? CMD_T : CMD_I;
     int fmt = IQC_FC32, lossy = 0, verify = 0, verbose = 0, opt;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int nth = ncpu < 1 ? 1 : ncpu > 8 ? 8 : (int)ncpu;
@@ -475,7 +505,10 @@ int main(int argc, char **argv) {
     const char *optstr = "f:s:ltj:vhV";
 #endif
     char *end;
-    while ((opt = getopt(argc, argv, optstr)) != -1) {
+    uint64_t skip = 0, count = UINT64_MAX;
+    int ranged = 0;
+    static const struct option longopts[] = {{"skip", required_argument, NULL, 'S'}, {"count", required_argument, NULL, 'C'}, {0, 0, 0, 0}};
+    while ((opt = getopt_long(argc, argv, optstr, longopts, NULL)) != -1) {
         switch (opt) {
         case 'f':
             if (!strcmp(optarg, "fc32")) fmt = IQC_FC32;
@@ -496,18 +529,28 @@ int main(int argc, char **argv) {
             nth = (int)v;
             break;
         }
+        case 'S': case 'C': {
+            errno = 0;
+            unsigned long long v = strtoull(optarg, &end, 10);
+            if (*end || end == optarg || *optarg == '-' || errno) { fprintf(stderr, "iqcodec: bad sample count %s\n", optarg); return 2; }
+            if (opt == 'S') skip = v; else count = v;
+            ranged = 1;
+            break;
+        }
         case 'v': verbose = 1; break;
         case 'V': puts("iqcodec " VERSION); return 0;
         case 'h': usage(stdout); return 0;
         default: usage(stderr); return 2;
         }
     }
-    if (argc - optind != (cmd == CMD_T ? 1 : 2)) { usage(stderr); return 2; }
-    const char *ip = argv[optind], *op = cmd == CMD_T ? NULL : argv[optind + 1];
+    if (argc - optind != (cmd >= CMD_T ? 1 : 2)) { usage(stderr); return 2; }
+    if (ranged && (cmd == CMD_C || cmd == CMD_I)) { fprintf(stderr, "iqcodec: --skip / --count are for d and t\n"); return 2; }
+    uint64_t lim = count > UINT64_MAX - skip ? UINT64_MAX : skip + count;
+    const char *ip = argv[optind], *op = cmd >= CMD_T ? NULL : argv[optind + 1];
     FILE *in = strcmp(ip, "-") ? fopen(ip, "rb") : stdin;
     if (!in) { fprintf(stderr, "iqcodec: %s: %s\n", ip, strerror(errno)); return 1; }
-    if (cmd == CMD_T) {
-        int rc = decompress(in, NULL, nth, verbose);
+    if (cmd >= CMD_T) {
+        int rc = decompress(in, NULL, nth, verbose, skip, lim, cmd == CMD_I);
         if (in != stdin) fclose(in);
         return rc;
     }
@@ -516,7 +559,7 @@ int main(int argc, char **argv) {
     if (!out) { if (in != stdin) fclose(in); return 1; }
     struct stat ist;
     int stream = !(fstat(fileno(in), &ist) == 0 && S_ISREG(ist.st_mode));
-    int rc = cmd == CMD_D ? decompress(in, out, nth, verbose) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
+    int rc = cmd == CMD_D ? decompress(in, out, nth, verbose, skip, lim, 0) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
     if (!close_output(out, op, rc == 0)) rc = 1;
     if (in != stdin) fclose(in);
     return rc;

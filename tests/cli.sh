@@ -41,6 +41,26 @@ if [ -d /dev/shm ] && [ -w /dev/shm ]; then                       # regular file
   rm -f "$S"
 fi
 
+# sample ranges: chunk boundaries (2^21), the end of the stream, pipes (no seeking)
+range() {   # usage: range SKIP COUNT [extra d args]: compares with the same bytes of a.fc32
+  "$BIN" d --skip "$1" --count "$2" "$T/a.iqc" "$T/r.out" 2>/dev/null
+  tail -c +$(($1 * 8 + 1)) "$T/a.fc32" | head -c $(($2 * 8)) | cmp - "$T/r.out" || fail "range $1 $2"
+}
+range 0 10; range 2097150 5; range 2097152 1; range 100 4194304; range 4999990 100; range 7000000 5
+"$BIN" d --count 0 "$T/a.iqc" "$T/r.out"; test ! -s "$T/r.out" || fail "count 0"
+tail -c +$((4194300 * 8 + 1)) "$T/a.fc32" > "$T/r.ref"
+"$BIN" d --skip 4194300 - "$T/r.out" < "$T/a.iqc"
+cmp "$T/r.out" "$T/r.ref"
+cat "$T/a.iqc" | "$BIN" d --skip 4194300 - "$T/r.out"
+cmp "$T/r.out" "$T/r.ref"
+"$BIN" t --skip 3000000 --count 10 "$T/a.iqc"
+"$BIN" i "$T/a.iqc" > "$T/info"
+grep -q "^samples  5000000 (40000000 bytes)" "$T/info" || fail "info: $(cat "$T/info")"
+grep -q "^chunks   3" "$T/info" || fail "info chunks"
+must_fail "$BIN" c --skip 3 "$T/a.fc32" "$T/o.iqc"
+must_fail "$BIN" d --skip -1 "$T/a.iqc" "$T/o"
+must_fail "$BIN" d --count 1x "$T/a.iqc" "$T/o"
+
 # lossy (-l): output decodes and verifies (to the quantized values, which are then exact)
 "$BIN" c -l -t "$T/b.sc16" "$T/l.iqc"                           # sc16 bytes read as fc32: inexact
 "$BIN" t "$T/l.iqc"
@@ -54,10 +74,12 @@ pos=200000
 old=$(od -An -tu1 -j $pos -N1 "$T/bad.iqc" | tr -d ' ')
 printf "$(printf '\\%03o' $(( (old + 1) % 256 )))" | dd of="$T/bad.iqc" bs=1 seek=$pos conv=notrunc 2>/dev/null
 must_fail "$BIN" t "$T/bad.iqc"
+"$BIN" t --skip 4194304 "$T/bad.iqc"                             # only the chunks in the range are read
 must_fail "$BIN" d "$T/bad.iqc" "$T/bad.out"
 test ! -e "$T/bad.out" || fail "partial output left behind"
 head -c 1000000 "$T/a.iqc" > "$T/short.iqc"
 must_fail "$BIN" t "$T/short.iqc"
+must_fail "$BIN" i "$T/short.iqc"
 cat "$T/b.iqc" "$T/b.iqc" > "$T/twice.iqc"
 must_fail "$BIN" t "$T/twice.iqc"
 must_fail "$BIN" d "$T/b.sc16" "$T/g.out"
