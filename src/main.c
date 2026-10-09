@@ -14,7 +14,7 @@
 #include "crc32c.h"
 #include "iqc.h"
 
-#define VERSION "0.2.1"
+#define VERSION "0.2.2"
 #define CHUNK (1 << 21)           // complex samples per independently coded chunk
 #define K_ORDER 24
 #define LEAF 8192
@@ -59,13 +59,32 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 static char tmp_path[PATH_MAX + 32];   // non-empty while a temporary output exists
 static char dst_path[PATH_MAX];        // regular-file OUTPUT after following symlinks (rename target)
 
-static void on_signal(int sig) { if (tmp_path[0]) unlink(tmp_path); signal(sig, SIG_DFL); raise(sig); }
-// Cleans up on fatal signals, except those the caller ignores (nohup, background jobs).
+static const int fatal_sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGXFSZ};
+static volatile sig_atomic_t graceful_int;   // compressing a stream: Ctrl-C finishes the file instead of aborting
+static volatile sig_atomic_t n_int;          // SIGINTs received in graceful mode
+
+static void on_signal(int sig) {
+    if (sig == SIGINT && graceful_int && n_int < 2) {
+        static const char m1[] = "\niqcodec: interrupted: finishing when the input ends "
+                                 "(Ctrl-C again: stop after the current chunk; a third time: abort)\n";
+        static const char m2[] = "\niqcodec: stopping after the current chunk\n";
+        n_int++;
+        ssize_t r = n_int == 1 ? write(STDERR_FILENO, m1, sizeof m1 - 1) : write(STDERR_FILENO, m2, sizeof m2 - 1);
+        (void)r;
+        return;
+    }
+    if (tmp_path[0]) unlink(tmp_path);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+// Cleans up on fatal signals, except those the caller ignores (nohup, background jobs). SA_RESTART keeps reads of
+// a recording pipe going after the first Ctrl-C.
 static void install_signal_handlers(void) {
-    static const int sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGXFSZ};
-    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++) {
-        struct sigaction old;
-        if (sigaction(sigs[i], NULL, &old) == 0 && old.sa_handler != SIG_IGN) signal(sigs[i], on_signal);
+    for (size_t i = 0; i < sizeof fatal_sigs / sizeof *fatal_sigs; i++) {
+        struct sigaction old, sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_signal; sa.sa_flags = SA_RESTART; sigemptyset(&sa.sa_mask);
+        if (sigaction(fatal_sigs[i], NULL, &old) == 0 && old.sa_handler != SIG_IGN) sigaction(fatal_sigs[i], &sa, NULL);
     }
 }
 
@@ -209,13 +228,6 @@ static void *dec_job(void *p) {
     if (!j->err && crc32c(0, j->raw, (size_t)j->n * ssize_of(j->fmt)) != j->crc) j->err = 2;
     return NULL;
 }
-static void run_jobs(Job *jobs, int nj, void *(*fn)(void *)) {
-    pthread_t th[64];
-    int started[64] = {0};
-    for (int i = 1; i < nj; i++) started[i] = pthread_create(&th[i], NULL, fn, &jobs[i]) == 0;
-    for (int i = 0; i < nj; i++) if (!started[i]) fn(&jobs[i]);   // job 0, and any thread that failed to start
-    for (int i = 1; i < nj; i++) if (started[i]) pthread_join(th[i], NULL);
-}
 static void free_jobs(Job *jobs, int nth) { for (int i = 0; i < nth; i++) { free(jobs[i].raw); free(jobs[i].enc); free(jobs[i].chk); free(jobs[i].qnt); } }
 
 // Picks the number of low bits for the sigma-delta tracker by trial on a prefix.
@@ -232,11 +244,67 @@ static int pick_shift(const void *raw, int fmt, int64_t n, float scale) {
     return shift;
 }
 
-static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int verify, int nth, int verbose) {
+// ---------------- pipeline: the main thread reads and writes in order, workers code slots as they come ----------------
+// Slot states: FREE -> (read) READY -> (worker) BUSY -> DONE -> (written) FREE. Workers take slots in sequence order,
+// so no chunk waits for a whole batch (P/E cores), and reading / writing overlap with coding.
+enum { S_FREE, S_READY, S_BUSY, S_DONE };
+#define MAX_TH 64
+#define MAX_SLOTS (MAX_TH + 2)
+typedef struct {
+    Job *jobs; int *state, ns, quit;
+    int64_t take;                      // next sequence number a worker takes
+    void *(*fn)(void *);
+    pthread_mutex_t mu; pthread_cond_t work, done;
+} Pool;
+static void *worker(void *p) {
+    Pool *pl = p;
+    pthread_mutex_lock(&pl->mu);
+    for (;;) {
+        int k = (int)(pl->take % pl->ns);
+        while (!pl->quit && pl->state[k] != S_READY) { pthread_cond_wait(&pl->work, &pl->mu); k = (int)(pl->take % pl->ns); }
+        if (pl->quit) break;
+        pl->take++; pl->state[k] = S_BUSY;
+        pthread_mutex_unlock(&pl->mu);
+        pl->fn(&pl->jobs[k]);
+        pthread_mutex_lock(&pl->mu);
+        pl->state[k] = S_DONE;
+        pthread_cond_broadcast(&pl->done);
+    }
+    pthread_mutex_unlock(&pl->mu);
+    return NULL;
+}
+// Starts the workers with the fatal signals blocked, so the main thread is the one that handles them.
+static int pool_start(Pool *pl, pthread_t *th, int nth) {
+    sigset_t block, old;
+    sigemptyset(&block);
+    for (size_t i = 0; i < sizeof fatal_sigs / sizeof *fatal_sigs; i++) sigaddset(&block, fatal_sigs[i]);
+    pthread_sigmask(SIG_BLOCK, &block, &old);
+    int n = 0;
+    for (; n < nth; n++) if (pthread_create(&th[n], NULL, worker, pl)) break;
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    return n;
+}
+static void pool_stop(Pool *pl, pthread_t *th, int n) {
+    pthread_mutex_lock(&pl->mu); pl->quit = 1; pthread_cond_broadcast(&pl->work); pthread_mutex_unlock(&pl->mu);
+    for (int i = 0; i < n; i++) pthread_join(th[i], NULL);
+}
+static void set_state(Pool *pl, int k, int st) {
+    pthread_mutex_lock(&pl->mu); pl->state[k] = st; if (st == S_READY) pthread_cond_broadcast(&pl->work); pthread_mutex_unlock(&pl->mu);
+}
+static int get_state(Pool *pl, int k) { pthread_mutex_lock(&pl->mu); int st = pl->state[k]; pthread_mutex_unlock(&pl->mu); return st; }
+static void wait_done(Pool *pl, int k) {
+    pthread_mutex_lock(&pl->mu); while (pl->state[k] != S_DONE) pthread_cond_wait(&pl->done, &pl->mu); pthread_mutex_unlock(&pl->mu);
+}
+
+// stream: INPUT is not a regular file (a recording pipe): Ctrl-C finishes the file, a trailing partial sample is dropped.
+static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int verify, int nth, int verbose, int stream) {
     size_t ssz = ssize_of(fmt);
-    Job jobs[64];
+    int ns = nth + 2, state[MAX_SLOTS] = {0}, nrun = 0, rc = 1;
+    Job jobs[MAX_SLOTS];
+    pthread_t th[MAX_TH];
     memset(jobs, 0, sizeof jobs);
-    for (int i = 0; i < nth; i++) {
+    Pool pl = {jobs, state, ns, 0, 0, enc_job, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+    for (int i = 0; i < ns; i++) {
         jobs[i].raw = malloc(CHUNK * ssz); jobs[i].cap = (int64_t)CHUNK * 8 + (1 << 20); jobs[i].enc = malloc(jobs[i].cap);
         if (verify) jobs[i].chk = malloc(CHUNK * ssz);
         if (!jobs[i].raw || !jobs[i].enc || (verify && !jobs[i].chk)) { fprintf(stderr, "iqcodec: out of memory\n"); goto fail; }
@@ -245,57 +313,69 @@ static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int ve
     memcpy(hdr, MAGIC, 4); hdr[4] = 2; hdr[5] = (uint8_t)fmt; hdr[6] = K_ORDER; hdr[7] = PREC;
     put32(hdr + 8, LEAF); memcpy(hdr + 12, &scale, 4);
     if (fwrite(hdr, 1, 16, out) != 16) goto werr;
-    int shift = -1, done = 0;
-    int64_t tot_in = 0, tot_out = 16, tot_inexact = 0, nchunk = 0;
+    int shift = -1, eof = 0;
+    int64_t tot_in = 0, tot_out = 16, tot_inexact = 0, rd = 0, wr = 0;
     uint64_t tot_samples = 0;
     double t0 = now();
-    while (!done) {
-        int nj = 0;
-        for (; nj < nth; nj++) {
-            size_t got = read_full(in, jobs[nj].raw, CHUNK * ssz);
+    nrun = pool_start(&pl, th, nth);
+    if (!nrun) { fprintf(stderr, "iqcodec: cannot start threads\n"); goto fail; }
+    graceful_int = stream;
+    while (!eof || wr < rd) {
+        if (!eof && rd - wr < ns) {   // read the next chunk into the next slot (free: it was written)
+            int k = (int)(rd % ns);
+            Job *j = &jobs[k];
+            size_t got = read_full(in, j->raw, CHUNK * ssz);
             if (ferror(in)) { fprintf(stderr, "iqcodec: read error: %s\n", strerror(errno)); goto fail; }
-            if (got % ssz) { fprintf(stderr, "iqcodec: input size is not a multiple of %zu bytes\n", ssz); goto fail; }
-            jobs[nj].n = got / ssz;
-            if (got < CHUNK * ssz) done = 1;
-            if (!got) break;
-            tot_in += got;
-            if (done) { nj++; break; }
-        }
-        if (!nj) break;
-        if (shift < 0) shift = pick_shift(jobs[0].raw, fmt, jobs[0].n, scale);
-        for (int i = 0; i < nj; i++) { jobs[i].fmt = fmt; jobs[i].scale = scale; jobs[i].shift = shift; jobs[i].verify = verify; }
-        run_jobs(jobs, nj, enc_job);
-        for (int i = 0; i < nj; i++, nchunk++) {
-            if (jobs[i].err == 2) { fprintf(stderr, "iqcodec: chunk %lld: verification failed (decoded data differs)\n", (long long)nchunk); goto fail; }
-            if (jobs[i].err) { fprintf(stderr, "iqcodec: chunk %lld: encoding failed\n", (long long)nchunk); goto fail; }
-            tot_inexact += jobs[i].inexact;
-            if (jobs[i].inexact && !lossy) {
-                fprintf(stderr, "iqcodec: input is not exactly int16 / %g (%lld values); use -s or -l\n", scale, (long long)jobs[i].inexact);
-                goto fail;
+            if (got % ssz) {
+                if (!stream) { fprintf(stderr, "iqcodec: input size is not a multiple of %zu bytes\n", ssz); goto fail; }
+                fprintf(stderr, "iqcodec: input ended inside a sample: %zu trailing bytes dropped\n", got % ssz);
+                got -= got % ssz;
+                eof = 1;
             }
-            uint8_t ch[16];
-            put32(ch, (uint32_t)jobs[i].n); ch[4] = (uint8_t)shift; ch[5] = ch[6] = ch[7] = 0;
-            put32(ch + 8, (uint32_t)jobs[i].size); put32(ch + 12, jobs[i].crc);
-            if (fwrite(ch, 1, 16, out) != 16 || fwrite(jobs[i].enc, 1, jobs[i].size, out) != (size_t)jobs[i].size) goto werr;
-            tot_out += 16 + jobs[i].size;
-            tot_samples += jobs[i].n;
+            if (got < CHUNK * ssz || n_int >= 2) eof = 1;
+            if (got) {
+                j->n = got / ssz; tot_in += got;
+                if (shift < 0) shift = pick_shift(j->raw, fmt, j->n, scale);
+                j->fmt = fmt; j->scale = scale; j->shift = shift; j->verify = verify;
+                set_state(&pl, k, S_READY); rd++;
+            }
+            if (!eof && rd - wr < ns && get_state(&pl, (int)(wr % ns)) != S_DONE) continue;   // keep reading ahead
         }
+        if (wr == rd) continue;
+        int k = (int)(wr % ns);
+        wait_done(&pl, k);
+        Job *j = &jobs[k];
+        if (j->err == 2) { fprintf(stderr, "iqcodec: chunk %lld: verification failed (decoded data differs)\n", (long long)wr); goto fail; }
+        if (j->err) { fprintf(stderr, "iqcodec: chunk %lld: encoding failed\n", (long long)wr); goto fail; }
+        tot_inexact += j->inexact;
+        if (j->inexact && !lossy) {
+            fprintf(stderr, "iqcodec: input is not exactly int16 / %g (%lld values); use -s or -l\n", scale, (long long)j->inexact);
+            goto fail;
+        }
+        uint8_t ch[16];
+        put32(ch, (uint32_t)j->n); ch[4] = (uint8_t)shift; ch[5] = ch[6] = ch[7] = 0;
+        put32(ch + 8, (uint32_t)j->size); put32(ch + 12, j->crc);
+        if (fwrite(ch, 1, 16, out) != 16 || fwrite(j->enc, 1, j->size, out) != (size_t)j->size) goto werr;
+        tot_out += 16 + j->size; tot_samples += j->n;
+        set_state(&pl, k, S_FREE); wr++;
     }
     uint8_t end[12] = {0};
     put32(end + 4, (uint32_t)tot_samples); put32(end + 8, (uint32_t)(tot_samples >> 32));
     if (fwrite(end, 1, 12, out) != 12) goto werr;
     tot_out += 12;
-    if (verbose)
-        fprintf(stderr, "%lld -> %lld bytes (%.2f%%, %.3fx), %.2f s%s%s\n", (long long)tot_in, (long long)tot_out,
+    if (verbose || n_int)
+        fprintf(stderr, "%lld -> %lld bytes (%.2f%%, %.3fx), %.2f s%s%s%s\n", (long long)tot_in, (long long)tot_out,
                 tot_in ? 100.0 * tot_out / tot_in : 0, tot_out ? (double)tot_in / tot_out : 0, now() - t0,
-                verify ? ", verified" : "", tot_inexact ? " (lossy: values quantized)" : "");
-    free_jobs(jobs, nth);
-    return 0;
+                verify ? ", verified" : "", tot_inexact ? " (lossy: values quantized)" : "", n_int ? " (stopped by Ctrl-C)" : "");
+    rc = 0;
+    goto done;
 werr:
     fprintf(stderr, "iqcodec: write error: %s\n", strerror(errno));
 fail:
-    free_jobs(jobs, nth);
-    return 1;
+done:
+    pool_stop(&pl, th, nrun);
+    free_jobs(jobs, ns);
+    return rc;
 }
 
 // out == NULL: test only.
@@ -308,63 +388,70 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose) {
     int fmt = hdr[5];
     float scale; memcpy(&scale, hdr + 12, 4);
     size_t ssz = ssize_of(fmt);
-    Job jobs[64];
+    int ns = nth + 2, state[MAX_SLOTS] = {0}, nrun = 0, rc = 1, eof = 0;
+    Job jobs[MAX_SLOTS];
+    pthread_t th[MAX_TH];
     memset(jobs, 0, sizeof jobs);
-    int64_t rawcap[64] = {0}, nchunk = 0;
-    uint64_t tot = 0;
+    Pool pl = {jobs, state, ns, 0, 0, dec_job, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
+    int64_t rawcap[MAX_SLOTS] = {0}, rd = 0, wr = 0;
+    uint64_t tot = 0, have = 0;
     double t0 = now();
-    for (int done = 0; !done;) {
-        int nj = 0;
-        for (; nj < nth; nj++) {
+    nrun = pool_start(&pl, th, nth);
+    if (!nrun) { fprintf(stderr, "iqcodec: cannot start threads\n"); goto fail; }
+    while (!eof || wr < rd) {
+        if (!eof && rd - wr < ns) {
             uint8_t ch[16];
             if (read_full(in, ch, 4) != 4) goto trunc;
             uint32_t n = get32(ch);
-            if (!n) {   // end marker: total sample count
+            if (!n) {   // end marker: total sample count, then nothing
                 uint8_t t[8];
                 if (read_full(in, t, 8) != 8) goto trunc;
-                uint64_t want = get32(t) | (uint64_t)get32(t + 4) << 32, have = tot;
-                for (int i = 0; i < nj; i++) have += jobs[i].n;
+                uint64_t want = get32(t) | (uint64_t)get32(t + 4) << 32;
                 if (want != have) { fprintf(stderr, "iqcodec: sample count mismatch (%llu expected, %llu found)\n", (unsigned long long)want, (unsigned long long)have); goto fail; }
                 if (fgetc(in) != EOF) { fprintf(stderr, "iqcodec: unexpected data after the end of the stream\n"); goto fail; }
                 if (ferror(in)) { fprintf(stderr, "iqcodec: read error: %s\n", strerror(errno)); goto fail; }
-                done = 1; break;
+                eof = 1;
+            } else {
+                if (read_full(in, ch + 4, 12) != 12) goto trunc;
+                uint32_t sz = get32(ch + 8);
+                if (n > CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto corrupt;
+                int k = (int)(rd % ns);
+                Job *j = &jobs[k];
+                if (sz > j->cap) { free(j->enc); j->cap = sz; j->enc = malloc(sz); }
+                if ((int64_t)n > rawcap[k]) { free(j->raw); rawcap[k] = n; j->raw = malloc((size_t)n * ssz); }
+                if (!j->enc || !j->raw) { fprintf(stderr, "iqcodec: out of memory\n"); goto fail; }
+                if (read_full(in, j->enc, sz) != sz) goto trunc;
+                j->n = n; j->size = sz; j->shift = ch[4]; j->fmt = fmt; j->scale = scale; j->crc = get32(ch + 12);
+                have += n;
+                set_state(&pl, k, S_READY); rd++;
+                if (rd - wr < ns && get_state(&pl, (int)(wr % ns)) != S_DONE) continue;   // keep reading ahead
             }
-            if (read_full(in, ch + 4, 12) != 12) goto trunc;
-            uint32_t sz = get32(ch + 8);
-            if (n > CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto corrupt;
-            Job *j = &jobs[nj];
-            if (sz > j->cap) { free(j->enc); j->cap = sz; j->enc = malloc(sz); }
-            if ((int64_t)n > rawcap[nj]) { free(j->raw); rawcap[nj] = n; j->raw = malloc((size_t)n * ssz); }
-            if (!j->enc || !j->raw) { fprintf(stderr, "iqcodec: out of memory\n"); goto fail; }
-            if (read_full(in, j->enc, sz) != sz) goto trunc;
-            j->n = n; j->size = sz; j->shift = ch[4]; j->fmt = fmt; j->scale = scale;
-            j->crc = get32(ch + 12);
         }
-        if (!nj) break;
-        run_jobs(jobs, nj, dec_job);
-        for (int i = 0; i < nj; i++, nchunk++) {
-            if (jobs[i].err == 2) { fprintf(stderr, "iqcodec: chunk %lld: checksum mismatch (corrupt data)\n", (long long)nchunk); goto fail; }
-            if (jobs[i].err) { fprintf(stderr, "iqcodec: chunk %lld: corrupt data\n", (long long)nchunk); goto fail; }
-            if (out && fwrite(jobs[i].raw, ssz, jobs[i].n, out) != (size_t)jobs[i].n) {
-                fprintf(stderr, "iqcodec: write error: %s\n", strerror(errno));
-                goto fail;
-            }
-            tot += jobs[i].n;
-        }
+        if (wr == rd) continue;
+        int k = (int)(wr % ns);
+        wait_done(&pl, k);
+        Job *j = &jobs[k];
+        if (j->err == 2) { fprintf(stderr, "iqcodec: chunk %lld: checksum mismatch (corrupt data)\n", (long long)wr); goto fail; }
+        if (j->err) { fprintf(stderr, "iqcodec: chunk %lld: corrupt data\n", (long long)wr); goto fail; }
+        if (out && fwrite(j->raw, ssz, j->n, out) != (size_t)j->n) { fprintf(stderr, "iqcodec: write error: %s\n", strerror(errno)); goto fail; }
+        tot += j->n;
+        set_state(&pl, k, S_FREE); wr++;
     }
     if (verbose)
         fprintf(stderr, "%llu samples (%llu bytes) %s, %.2f s, checksums verified\n", (unsigned long long)tot,
                 (unsigned long long)(tot * ssz), out ? "written" : "OK", now() - t0);
-    free_jobs(jobs, nth);
-    return 0;
+    rc = 0;
+    goto done;
 trunc:
     fprintf(stderr, "iqcodec: truncated input\n");
     goto fail;
 corrupt:
-    fprintf(stderr, "iqcodec: chunk %lld: corrupt header\n", (long long)nchunk);
+    fprintf(stderr, "iqcodec: chunk %lld: corrupt header\n", (long long)rd);
 fail:
-    free_jobs(jobs, nth);
-    return 1;
+done:
+    pool_stop(&pl, th, nrun);
+    free_jobs(jobs, ns);
+    return rc;
 }
 
 int main(int argc, char **argv) {
@@ -422,7 +509,9 @@ int main(int argc, char **argv) {
     install_signal_handlers();
     FILE *out = open_output(op, in);
     if (!out) { if (in != stdin) fclose(in); return 1; }
-    int rc = cmd == CMD_D ? decompress(in, out, nth, verbose) : compress(in, out, fmt, scale, lossy, verify, nth, verbose);
+    struct stat ist;
+    int stream = !(fstat(fileno(in), &ist) == 0 && S_ISREG(ist.st_mode));
+    int rc = cmd == CMD_D ? decompress(in, out, nth, verbose) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
     if (!close_output(out, op, rc == 0)) rc = 1;
     if (in != stdin) fclose(in);
     return rc;

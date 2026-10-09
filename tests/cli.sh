@@ -105,6 +105,30 @@ test ! -e "$T/q.iqc" || fail "output created by an interrupted run"
 if (ulimit -f 20; exec "$BIN" c -f sc16 "$T/b.sc16" "$T/f.iqc") 2>/dev/null; then fail "file size limit ignored"; fi
 no_temp SIGXFSZ
 
+# live recording from a pipe: Ctrl-C finishes the file instead of losing it. The pipelines end in perl, which
+# restores the default SIGINT that background jobs of a script start without and execs iqcodec in the same
+# process (so $! is iqcodec). Run with a file size limit and a watchdog: these producers never end on their own.
+live() (   # usage: live OUT N_INTS GAP; endless producer of $T/b.sc16 at about 20 MB/s
+  ulimit -f 409600
+  (while :; do cat "$T/b.sc16" || exit; sleep 0.05; done) | perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' "$BIN" c -f sc16 - "$1" & pid=$!
+  (sleep 20; kill -KILL $pid 2>/dev/null) & dog=$!
+  sleep 1; i=0; while [ $i -lt "$2" ]; do kill -INT $pid; sleep "$3"; i=$((i + 1)); done
+  wait $pid; rc=$?; kill $dog 2>/dev/null; return $rc
+)
+(ulimit -f 409600; (cat "$T/a.fc32"; sleep 2) | perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' "$BIN" c - "$T/live1.iqc" & pid=$!
+ sleep 1; kill -INT $pid; wait $pid) || fail "Ctrl-C on a recording pipe did not finish the file"
+"$BIN" d "$T/live1.iqc" "$T/live1.out"
+cmp "$T/live1.out" "$T/a.fc32"                                   # everything up to the end of the input
+live "$T/live2.iqc" 2 0.3 2>/dev/null || fail "second Ctrl-C did not stop the recording cleanly"
+"$BIN" t "$T/live2.iqc"
+# three quick Ctrl-Cs (before the current chunk ends) abort
+if live "$T/live3.iqc" 3 0.05 2>/dev/null; then fail "third Ctrl-C did not abort"; fi
+test ! -e "$T/live3.iqc" || fail "aborted recording left output"
+no_temp "aborted recording"
+{ cat "$T/b.sc16"; printf x; } | "$BIN" c -f sc16 - "$T/part.iqc" 2>/dev/null   # partial last sample dropped
+"$BIN" d "$T/part.iqc" "$T/part.out"
+cmp "$T/part.out" "$T/b.sc16"
+
 # options
 must_fail "$BIN" c -j x "$T/a.fc32" "$T/o.iqc"
 must_fail "$BIN" c -j 0 "$T/a.fc32" "$T/o.iqc"

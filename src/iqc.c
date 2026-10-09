@@ -13,6 +13,10 @@
 #include <math.h>
 #include <pthread.h>
 #include "iqc.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#define IQC_NEON 1
+#include <arm_neon.h>
+#endif
 
 #define NCTX 64
 #define MANT_BITS 2      // top mantissa bits folded into the rANS symbol (part of the stream format)
@@ -22,12 +26,6 @@
 #define PROB_SCALE (1 << PROB_BITS)
 
 static inline int nbits(uint32_t m) { return m ? 32 - __builtin_clz(m) : 0; }
-static inline int qlog(uint32_t v) {  // ~4 buckets per octave
-    if (!v) return 0;
-    int b = 31 - __builtin_clz(v);
-    int top = b >= 2 ? (v >> (b - 2)) & 3 : (v << (2 - b)) & 3;
-    return 1 + b * 4 + top;
-}
 
 // ---------------- forward bit streams (LSB first) ----------------
 typedef struct { uint8_t *buf; size_t cap, pos; uint64_t acc; int n; } BitW;
@@ -276,6 +274,10 @@ static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? 
 
 #define RTILE 512   // residual tile (tstep > 1 evaluates only every tstep-th tile, for cost estimates)
 // Encoder-side arrays hold the high parts as interleaved int16 (I, Q) pairs with K zero samples of padding.
+// IQC_NO_SIMD=1 selects the portable code paths (same output), read once.
+static int no_simd;
+static void read_no_simd(void) { no_simd = getenv("IQC_NO_SIMD") != NULL; }
+static int simd_disabled(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, read_no_simd); return no_simd; }
 // Exact int64 sums C_{0,j} = sum_{t in [s,e)} z_t z_{t-j}^T (additive over adjacent ranges).
 // Portable version on planar int32 copies (vectorizes over t without SIMD intrinsics).
 static void cov_sums(const int32_t *I, const int32_t *Q, int64_t s, int64_t e, int K, int64_t (*S)[4]) {
@@ -295,7 +297,7 @@ static int avx512vnni_ok;
 static void detect_avx512vnni(void) {
     __builtin_cpu_init();
     avx512vnni_ok = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-                    __builtin_cpu_supports("avx512vnni") && !getenv("IQC_NO_SIMD");
+                    __builtin_cpu_supports("avx512vnni") && !simd_disabled();
 }
 static int have_avx512vnni(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -385,6 +387,76 @@ static void block_residuals(const int32_t *I, const int32_t *Q, int64_t s, int64
         for (int t = 0; t < n; t++) rQ[t0 - s + t] = Qs[t] - clampi(acc[t] >> sh, hmin, hmax);
     }
 }
+#if IQC_NEON
+// Covariance sums from interleaved int16 pairs with SMLAL: A*B gives lanes (I I', Q Q') -> s0, s3; A*rev(B) gives
+// (I Q', Q I') -> s1, s2. Two lags per pass share the loads of z_t. Needs |z| <= 2^13: one product < 2^26 per lane
+// per step, 16 steps per int32 accumulator before it is widened to int64. Same sums as cov_sums.
+static void cov_sums_neon(const int16_t *z, int64_t s, int64_t e, int K, int64_t (*S)[4]) {
+    for (int j = 0; j <= K; j += 2) {
+        int j2 = j + 1 <= K ? j + 1 : j;
+        int64x2_t P0 = vdupq_n_s64(0), X0 = P0, P1 = P0, X1 = P0;
+        int64_t t = s;
+        while (t + 4 <= e) {
+            int32x4_t pl = vdupq_n_s32(0), ph = pl, xl = pl, xh = pl, ql = pl, qh = pl, yl = pl, yh = pl;
+            for (int c = 0; c < 16 && t + 4 <= e; c++, t += 4) {
+                int16x8_t A = vld1q_s16(z + 2 * t), B = vld1q_s16(z + 2 * (t - j)), Bs = vrev32q_s16(B);
+                int16x8_t C = vld1q_s16(z + 2 * (t - j2)), Cs = vrev32q_s16(C);
+                pl = vmlal_s16(pl, vget_low_s16(A), vget_low_s16(B)); ph = vmlal_high_s16(ph, A, B);
+                xl = vmlal_s16(xl, vget_low_s16(A), vget_low_s16(Bs)); xh = vmlal_high_s16(xh, A, Bs);
+                ql = vmlal_s16(ql, vget_low_s16(A), vget_low_s16(C)); qh = vmlal_high_s16(qh, A, C);
+                yl = vmlal_s16(yl, vget_low_s16(A), vget_low_s16(Cs)); yh = vmlal_high_s16(yh, A, Cs);
+            }
+            P0 = vaddw_s32(vaddw_s32(vaddw_high_s32(vaddw_high_s32(P0, pl), ph), vget_low_s32(pl)), vget_low_s32(ph));
+            X0 = vaddw_s32(vaddw_s32(vaddw_high_s32(vaddw_high_s32(X0, xl), xh), vget_low_s32(xl)), vget_low_s32(xh));
+            P1 = vaddw_s32(vaddw_s32(vaddw_high_s32(vaddw_high_s32(P1, ql), qh), vget_low_s32(ql)), vget_low_s32(qh));
+            X1 = vaddw_s32(vaddw_s32(vaddw_high_s32(vaddw_high_s32(X1, yl), yh), vget_low_s32(yl)), vget_low_s32(yh));
+        }
+        for (int w = 0; w < 2; w++) {   // tail samples, then store (j2 == j repeats the same lag)
+            int jj = w ? j2 : j;
+            int64x2_t PP = w ? P1 : P0, XX = w ? X1 : X0;
+            int64_t s0 = vgetq_lane_s64(PP, 0), s3 = vgetq_lane_s64(PP, 1), s1 = vgetq_lane_s64(XX, 0), s2 = vgetq_lane_s64(XX, 1);
+            for (int64_t u = t; u < e; u++) {
+                int64_t I = z[2 * u], Q = z[2 * u + 1], Ij = z[2 * (u - jj)], Qj = z[2 * (u - jj) + 1];
+                s0 += I * Ij; s1 += I * Qj; s2 += Q * Ij; s3 += Q * Qj;
+            }
+            S[jj][0] = s0; S[jj][1] = s1; S[jj][2] = s2; S[jj][3] = s3;
+        }
+    }
+}
+// Residuals on the planar int32 copies, 8 samples held in registers across all taps (same integers).
+static void block_residuals_neon(const int32_t *I, const int32_t *Q, int64_t s, int64_t e, int K, const int32_t *q, int sh,
+                                 int hmin, int hmax, int32_t *rI, int32_t *rQ, int tstep) {
+    int32_t ca[36] = {0}, cb[36] = {0}, cc[36] = {0}, cd[36] = {0}, rnd = sh ? 1 << (sh - 1) : 0;
+    for (int j = 1; j <= K; j++) { ca[j - 1] = q[2 * j - 2]; cb[j - 1] = q[2 * j - 1]; cc[j - 1] = q[2 * K + 2 * j - 2]; cd[j - 1] = q[2 * K + 2 * j - 1]; }
+    const int32x4_t R = vdupq_n_s32(rnd), SH = vdupq_n_s32(-sh), LO = vdupq_n_s32(hmin), HI = vdupq_n_s32(hmax);
+    for (int64_t t0 = s; t0 < e; t0 += (int64_t)RTILE * tstep) {
+        int64_t t1 = t0 + RTILE < e ? t0 + RTILE : e, t = t0;
+        for (; t + 8 <= t1; t += 8) {
+            int32x4_t I0 = vld1q_s32(I + t), I1 = vld1q_s32(I + t + 4);
+            int32x4_t aI0 = R, aI1 = R, aQ0 = vmlaq_n_s32(R, I0, q[4 * K]), aQ1 = vmlaq_n_s32(R, I1, q[4 * K]);
+            for (int j0 = 0; j0 < K; j0 += 4) {
+                int32x4_t A = vld1q_s32(ca + j0), B = vld1q_s32(cb + j0), C = vld1q_s32(cc + j0), D = vld1q_s32(cd + j0);
+#define TAP(l) if (j0 + l < K) { const int32_t *Ih = I + t - (j0 + l + 1), *Qh = Q + t - (j0 + l + 1); \
+                    int32x4_t h0 = vld1q_s32(Ih), h1 = vld1q_s32(Ih + 4), g0 = vld1q_s32(Qh), g1 = vld1q_s32(Qh + 4); \
+                    aI0 = vmlaq_laneq_s32(vmlaq_laneq_s32(aI0, h0, A, l), g0, B, l); aI1 = vmlaq_laneq_s32(vmlaq_laneq_s32(aI1, h1, A, l), g1, B, l); \
+                    aQ0 = vmlaq_laneq_s32(vmlaq_laneq_s32(aQ0, h0, C, l), g0, D, l); aQ1 = vmlaq_laneq_s32(vmlaq_laneq_s32(aQ1, h1, C, l), g1, D, l); }
+                TAP(0) TAP(1) TAP(2) TAP(3)
+#undef TAP
+            }
+            int32x4_t Q0 = vld1q_s32(Q + t), Q1 = vld1q_s32(Q + t + 4);
+            vst1q_s32(rI + (t - s), vsubq_s32(I0, vminq_s32(vmaxq_s32(vshlq_s32(aI0, SH), LO), HI)));
+            vst1q_s32(rI + (t - s) + 4, vsubq_s32(I1, vminq_s32(vmaxq_s32(vshlq_s32(aI1, SH), LO), HI)));
+            vst1q_s32(rQ + (t - s), vsubq_s32(Q0, vminq_s32(vmaxq_s32(vshlq_s32(aQ0, SH), LO), HI)));
+            vst1q_s32(rQ + (t - s) + 4, vsubq_s32(Q1, vminq_s32(vmaxq_s32(vshlq_s32(aQ1, SH), LO), HI)));
+        }
+        for (; t < t1; t++) {
+            int32_t aI = rnd, aQ = rnd + q[4 * K] * I[t];
+            for (int j = 1; j <= K; j++) { aI += q[2 * j - 2] * I[t - j] + q[2 * j - 1] * Q[t - j]; aQ += q[2 * K + 2 * j - 2] * I[t - j] + q[2 * K + 2 * j - 1] * Q[t - j]; }
+            rI[t - s] = I[t] - clampi(aI >> sh, hmin, hmax); rQ[t - s] = Q[t] - clampi(aQ >> sh, hmin, hmax);
+        }
+    }
+}
+#endif
 // Residuals for a block: SIMD on the interleaved int16 array when available (int16 coefficients are
 // guaranteed by quantize()), otherwise the portable version on the planar copies.
 // I, Q: planar copies whose index 0 is sample `base` (valid from index -K).
@@ -394,6 +466,9 @@ static void residuals(int simd, const int16_t *z, const int32_t *I, const int32_
     if (simd) { block_residuals_avx512(z, s, e, K, q, sh, hmin, hmax, rI, rQ, tstep); return; }
 #endif
     (void)simd; (void)z;
+#if IQC_NEON
+    if (!simd_disabled()) { block_residuals_neon(I, Q, s - base, e - base, K, q, sh, hmin, hmax, rI, rQ, tstep); return; }
+#endif
     block_residuals(I, Q, s - base, e - base, K, q, sh, hmin, hmax, rI, rQ, tstep);
 }
 // Least squares for block [s,e) of padded int32 history z: I_t on lags, Q_t on lags + I_t. Normal equations
@@ -484,8 +559,16 @@ static void split_bounds(int sb, int *bounds, int *nblocks) {
 }
 // Contexts use magnitude averages lagged by one sample (residuals up to t-2): this keeps the decoder's
 // serial dependency chain short and costs nothing in size.
-static inline int ctx_I(uint32_t aI, uint32_t aQ) { int c = qlog(2 * aI + aQ); return c >= NCTX ? NCTX - 1 : c; }
-static inline int ctx_Q(uint32_t aI, uint32_t aQ) { int c = qlog(aQ + aI / 2); return c >= NCTX ? NCTX - 1 : c; }
+// Context = min(qlog(v), NCTX - 1) with qlog ~4 buckets per octave: 0 for v = 0, else 1 + 4b + (2 bits below the
+// leading one), b = floor(log2 v) (part of the stream format). This branch-light form equals it for all 2^32 v.
+static inline int ctx_of(uint32_t v) {
+    static const uint8_t small[4] = {0, 1, 5, 7};
+    int s = 29 - __builtin_clz(v | 4), c = 4 * s + 5 + (int)(v >> s);
+    c = v < 4 ? small[v & 3] : c;
+    return c > NCTX - 1 ? NCTX - 1 : c;
+}
+static inline int ctx_I(uint32_t aI, uint32_t aQ) { return ctx_of(2 * aI + aQ); }
+static inline int ctx_Q(uint32_t aI, uint32_t aQ) { return ctx_of(aQ + aI / 2); }
 
 static void put_u32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
 static uint32_t get_u32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -521,8 +604,7 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     init_syms();
     int16_t *z16 = calloc(2 * (n + K) + 32, sizeof(int16_t)), *zp = z16 + 2 * K;   // high parts, zero-padded history
     int32_t zmax = 0;
-    uint8_t *l = malloc(2 * n + 1), *sym = malloc(2 * n + 1), *ctx = malloc(2 * n + 1), *nraw = malloc(2 * n + 1);
-    uint16_t *raw = malloc((2 * n + 1) * sizeof(uint16_t));
+    uint8_t *l = malloc(2 * n + 1), *sym = malloc(2 * n + 1), *ctx = malloc(2 * n + 1);
     int nb = (int)((n + BL - 1) / BL);   // leaves (upper bound on LPC blocks)
     // side: tables (< 26 KB) + per block <= 11 + nc * 16 bits + 3 split bits per superblock
     size_t caps[4] = {(size_t)nb * (nc * 16 + 14) / 8 + 65536, (size_t)n + 4096, (size_t)n * 4 + 64, (size_t)n * 5 + 64};
@@ -538,19 +620,21 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     SymTab (*tab)[NCTX] = calloc(2, sizeof *tab);
     EncSym *es = malloc(sizeof(EncSym) * 2 * NCTX * NSYM);
     uint16_t *ev = NULL; Trk *tk = NULL;
-    if (!es || !l || !sym || !ctx || !nraw || !raw || !sec[0] || !sec[1] || !sec[2] || !sec[3] || !cq || !csh || !cf || !cnt || !tab
+    if (!es || !l || !sym || !ctx || !sec[0] || !sec[1] || !sec[2] || !sec[3] || !cq || !csh || !cf || !cnt || !tab
         || !sbits || !cand_q || !tmpI || !z16 || !plI || !plQ || !LS || !Ssum) goto done;
-    for (int64_t i = 0; i < 2 * n; i++) {
-        int32_t q;
-        if (fmt == IQC_SC16) q = x16[i];
-        else {
-            q = quant(x[i], scale);
-            float back = (float)q * inv;   // what the decoder will produce
-            nbad += memcmp(&back, &x[i], sizeof back) != 0;
+    if (fmt == IQC_SC16)
+        for (int64_t i = 0; i < 2 * n; i++) {
+            int32_t q = x16[i], h = q >> shift, a = h < 0 ? -h : h;
+            zp[i] = (int16_t)h; l[i] = (uint8_t)(q & lmask); zmax = a > zmax ? a : zmax;
         }
-        int32_t h = q >> shift, a = h < 0 ? -h : h;
-        zp[i] = (int16_t)h; l[i] = (uint8_t)(q & lmask); zmax = a > zmax ? a : zmax;
-    }
+    else
+        for (int64_t i = 0; i < 2 * n; i++) {
+            int32_t q = quant(x[i], scale), h = q >> shift, a = h < 0 ? -h : h;
+            float back = (float)q * inv;   // what the decoder will produce, compared bit for bit
+            uint32_t bb, xb; memcpy(&bb, &back, 4); memcpy(&xb, &x[i], 4);
+            nbad += bb != xb;
+            zp[i] = (int16_t)h; l[i] = (uint8_t)(q & lmask); zmax = a > zmax ? a : zmax;
+        }
     int simd = 0, simd_cov = 0;
 #if IQC_X86
     simd = have_avx512vnni() && K <= 32;
@@ -567,6 +651,18 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
         trk_init(&tk[0]); trk_init(&tk[1]);
         for (int64_t t = 0; t < n; t++) for (int ch = 0; ch < 2; ch++) {
             Trk *k = &tk[ch];
+            if (k->has) {   // fast path (same result as below): a mode-D step that hits and stays strictly inside the strip
+                Dss *ds = &k->d;
+                int64_t r0 = ds->rl + ds->a, mu = ds->mu, b = ds->b;
+                int ok0 = r0 >= mu - 1 && r0 <= mu + b, ok1 = r0 - b >= mu - 1, step = !ok0, uu = k->k + step;
+                int64_t r = r0 - (step ? b : 0);
+                if (!(ok0 & ok1) && ((l[2 * t + ch] - uu) & lmask) == 0 && r > mu && r < mu + b - 1) {
+                    ev[2 * t + ch] = 0;
+                    ds->rl = r; ds->last.x++; ds->last.y += step;
+                    k->t++; k->Y += uu; k->hist[k->t & (DSL_HIST - 1)] = (int16_t)uu;
+                    continue;
+                }
+            }
             int v0 = 0, ac = 0, mode = trk_predict(k, &v0, &ac), s = l[2 * t + ch], u, e = 0, chs = 0;
             if (mode == MODE_D && ((s - v0) & lmask) == 0) u = v0;
             else if (mode == MODE_A && ((s - v0) & lmask) < 2) { chs = (s - v0) & lmask; u = v0 + chs; }
@@ -577,13 +673,22 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
         // Pass 2: emit in decoding order.
         LowModel lm[2]; low_init(&lm[0]); low_init(&lm[1]);
         int need[2] = {1, 1};
-        for (int64_t t = 0; t < n; t++) for (int ch = 0; ch < 2; ch++) {
-            uint16_t v = ev[2 * t + ch];
-            int mode = v & 3, s = l[2 * t + ch];
+        for (int64_t i = 0; i < 2 * n; i++) {
+            if (!(need[0] | need[1]))   // plain mode-D steps (ev == 0) emit nothing: skip them four at a time
+                while (i + 4 <= 2 * n && !(ev[i] | ev[i + 1] | ev[i + 2] | ev[i + 3])) i += 4;
+            if (i >= 2 * n) break;
+            int64_t t = i >> 1;
+            int ch = (int)(i & 1);
+            uint16_t v = ev[i];
+            int mode = v & 3, s = l[i];
             if (mode == MODE_N) { tree_code(&lc, lm[ch].exc[2], shift, s); continue; }
             if (need[ch]) {   // number of regular D/A steps before the next exception (forward scan, O(n) overall)
                 uint32_t g = 0;
-                for (int64_t u = t; u < n; u++) { uint16_t w = ev[2 * u + ch]; if ((w & 3) == MODE_N) continue; if (w & 4) break; g++; }
+                int64_t u = t;
+                for (; u < n && u < 1; u++) { uint16_t w = ev[2 * u + ch]; if ((w & 3) == MODE_N) continue; if (w & 4) goto gap_done; g++; }
+                for (; u + 2 <= n && !((ev[2 * u + ch] | ev[2 * u + 2 + ch]) & 4); u += 2) g += 2;   // no mode N after t = 0
+                for (; u < n; u++) { if (ev[2 * u + ch] & 4) break; g++; }
+            gap_done:
                 gap_code(&lc, lm[ch].gap, g + 1); need[ch] = 0;
             }
             if (v & 4) { tree_code(&lc, lm[ch].exc[mode], shift, s); need[ch] = 1; }
@@ -595,6 +700,7 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     // --- high part. Superblocks of 4 leaves (BL samples each); the encoder picks the split (1x4, 2x2, 2+1+1, 4x1
     // leaves per LPC block) with the smallest estimated cost; covariance sums are computed once per leaf.
     uint32_t aI = 0, aQ = 0, oI = 0, oQ = 0;   // current and one-sample-lagged magnitude averages
+    BitW rw = {sec[2], caps[2], 0, 0, 0};
     int nblk = 0;
     for (int64_t S0 = 0; S0 < n; S0 += 4 * (int64_t)BL) {
         int64_t lb[5];
@@ -605,6 +711,9 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
         for (int i = 0; i < 4; i++) {
 #if IQC_X86
             if (simd_cov) { cov_sums_avx512(zp, lb[i], lb[i + 1], K, LS[i]); continue; }
+#endif
+#if IQC_NEON
+            if (zmax <= 8192 && !simd_disabled()) { cov_sums_neon(zp, lb[i], lb[i + 1], K, LS[i]); continue; }
 #endif
             cov_sums(Ip, Qp, lb[i] - S0, lb[i + 1] - S0, K, LS[i]);
         }
@@ -645,12 +754,13 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
             memcpy(cq + (size_t)nblk * nc, cand_q + (size_t)c * nc, nc * sizeof(int32_t)); csh[nblk++] = cand_sh[c];
             int32_t *crI = tmpI, *crQ = tmpQ;
             residuals(simd, zp, Ip, Qp, S0, s, e, K, cand_q + (size_t)c * nc, cand_sh[c], hmin, hmax, crI, crQ, 1);
-            for (int64_t t = s; t < e; t++) {
-                int rI = crI[t - s], rQ = crQ[t - s], nr;
-                uint32_t r32, mI = rI < 0 ? -rI : rI, mQ = rQ < 0 ? -rQ : rQ;
-                ctx[2 * t] = (uint8_t)ctx_I(oI, oQ); sym[2 * t] = (uint8_t)res_sym(rI, &r32, &nr); raw[2 * t] = (uint16_t)r32; nraw[2 * t] = (uint8_t)nr;
-                ctx[2 * t + 1] = (uint8_t)ctx_Q(oI, oQ); sym[2 * t + 1] = (uint8_t)res_sym(rQ, &r32, &nr); raw[2 * t + 1] = (uint16_t)r32; nraw[2 * t + 1] = (uint8_t)nr;
-                cnt[0][ctx[2 * t]][sym[2 * t]]++; cnt[1][ctx[2 * t + 1]][sym[2 * t + 1]]++;
+            for (int64_t t = s; t < e; t++) {   // symbols + contexts; remaining mantissa bits and signs go to the raw stream
+                int rI = crI[t - s], rQ = crQ[t - s], n0, n1;
+                uint32_t w0, w1, mI = rI < 0 ? -rI : rI, mQ = rQ < 0 ? -rQ : rQ;
+                int c0 = ctx_I(oI, oQ), c1 = ctx_Q(oI, oQ), s0 = res_sym(rI, &w0, &n0), s1 = res_sym(rQ, &w1, &n1);
+                ctx[2 * t] = (uint8_t)c0; sym[2 * t] = (uint8_t)s0; ctx[2 * t + 1] = (uint8_t)c1; sym[2 * t + 1] = (uint8_t)s1;
+                bw_put(&rw, w0, n0); bw_put(&rw, w1, n1);
+                cnt[0][c0][s0]++; cnt[1][c1][s1]++;
                 oI = aI; oQ = aQ;
                 aI = aI - (aI >> 3) + (mI << 1); aQ = aQ - (aQ >> 3) + (mQ << 1);
             }
@@ -675,9 +785,7 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     }
     bw_flush(&side);
 
-    // --- raw bits (forward) and rANS (reverse, two interleaved states sharing one word stream)
-    BitW rw = {sec[2], caps[2], 0, 0, 0};
-    for (int64_t i = 0; i < 2 * n; i++) bw_put(&rw, raw[i], nraw[i]);
+    // --- raw bits (written above) and rANS (reverse, two interleaved states sharing one word stream)
     bw_flush(&rw);
     uint8_t *rend = sec[3] + caps[3], *rp = rend;
     uint32_t xs[2] = {RANS_L, RANS_L};
@@ -687,7 +795,9 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     for (int64_t i = 2 * n - 1; i >= 0; i--) {
         const EncSym *e = &es[((i & 1) * NCTX + ctx[i]) * NSYM + sym[i]];
         uint32_t xv = xs[i & 1];
-        if (xv >= e->x_max) { PUTW(xv & 0xFFFF); xv >>= 16; }
+        int f = xv >= e->x_max;   // branchless renormalisation: always store the word, keep it only when needed
+        rp[-2] = (uint8_t)xv; rp[-1] = (uint8_t)(xv >> 8);
+        rp -= 2 * f; xv >>= 16 * f;
 #ifdef __SIZEOF_INT128__
         uint32_t qt = e->rcp ? (uint32_t)(((unsigned __int128)xv * e->rcp) >> 64) : xv;
 #else
@@ -709,7 +819,7 @@ int64_t iqc_encode(const void *in, int fmt, int64_t n, float scale, int shift, i
     }
 done:
     if (inexact) *inexact = nbad;
-    free(l); free(sym); free(ctx); free(nraw); free(raw); for (int i = 0; i < 4; i++) free(sec[i]);
+    free(l); free(sym); free(ctx); for (int i = 0; i < 4; i++) free(sec[i]);
     free(cq); free(csh); free(cf); free(cnt); free(tab); free(ev); free(tk);
     free(sbits); free(cand_q); free(es); free(tmpI); free(z16); free(plI); free(plQ); free(LS); free(Ssum);
     return ret;
@@ -731,6 +841,20 @@ typedef struct {
 ALWAYS_INLINE void dec_low(DecSt *d, int lo[2]) {
     for (int ch = 0; ch < 2; ch++) {
         Trk *k = &d->tk[ch];
+        if (k->has && d->gap[ch] > 0) {   // fast path (same result as below): a regular mode-D step strictly inside the strip
+            Dss *ds = &k->d;
+            int64_t r0 = ds->rl + ds->a, mu = ds->mu, b = ds->b;
+            int ok0 = r0 >= mu - 1 && r0 <= mu + b, ok1 = r0 - b >= mu - 1, step = !ok0;
+            int64_t r = r0 - (step ? b : 0);
+            if (!(ok0 & ok1) && r > mu && r < mu + b - 1) {
+                int u = k->k + step;
+                d->gap[ch]--;
+                ds->rl = r; ds->last.x++; ds->last.y += step;
+                k->t++; k->Y += u; k->hist[k->t & (DSL_HIST - 1)] = (int16_t)u;
+                lo[ch] = u & d->lmask;
+                continue;
+            }
+        }
         int v0 = 0, ac = 0, mode = trk_predict(k, &v0, &ac), s, u;
         if (mode == MODE_N) { s = tree_code(&d->lc, d->lm[ch].exc[2], d->shift, 0); u = unwrap(k, s, d->M); }
         else {
@@ -793,6 +917,70 @@ static void dec_block_generic(DecSt *d, int32_t *zp, int64_t b0, int64_t b1, con
     }
 }
 
+#if IQC_NEON
+// Transposed FIR in NEON registers: lane j of P*[r] is the partial prediction for time t + 4r + j (rounding constant
+// included). Each new (I, Q) pair is added with SMLAL by lane (int16 coefficients, guaranteed by the block check);
+// lane 0 of the next prediction is updated on the scalar side so the vector work stays off the dependency chain.
+// Integer results are identical to the direct form (sums bounded, see quantize()).
+ALWAYS_INLINE void dec_block_neon_t(DecSt *d, int32_t *zp, int64_t b0, int64_t b1, const int32_t *q, int K, int sh, void *out, const int NR) {
+    int16_t ca[32] = {0}, cb[32] = {0}, da[32] = {0}, db[32] = {0};
+    int32_t pi[32], pq[32], rnd = sh ? 1 << (sh - 1) : 0, c0 = q[4 * K];
+    for (int j = 1; j <= K; j++) { ca[j - 1] = q[2 * j - 2]; cb[j - 1] = q[2 * j - 1]; da[j - 1] = q[2 * K + 2 * j - 2]; db[j - 1] = q[2 * K + 2 * j - 1]; }
+    for (int j = 0; j < 4 * NR; j++) pi[j] = pq[j] = rnd;
+    for (int j = 0; j < K; j++)   // contributions of samples before b0 to predictions b0 + j
+        for (int i = j + 1; i <= K; i++) {
+            int64_t s = b0 + j - i;
+            pi[j] += q[2 * i - 2] * zp[2 * s] + q[2 * i - 1] * zp[2 * s + 1];
+            pq[j] += q[2 * K + 2 * i - 2] * zp[2 * s] + q[2 * K + 2 * i - 1] * zp[2 * s + 1];
+        }
+    const int32x4_t R = vdupq_n_s32(rnd);   // enters at the top lane
+    int16x8_t CA[4], CB[4], DA[4], DB[4];
+    int32x4_t PI[8], PQ[8];
+    for (int r = 0; r < (NR + 1) / 2; r++) { CA[r] = vld1q_s16(ca + 8 * r); CB[r] = vld1q_s16(cb + 8 * r); DA[r] = vld1q_s16(da + 8 * r); DB[r] = vld1q_s16(db + 8 * r); }
+    for (int r = 0; r < NR; r++) { PI[r] = vld1q_s32(pi + 4 * r); PQ[r] = vld1q_s32(pq + 4 * r); }
+    int32_t a1 = ca[0], g1 = cb[0], e1 = da[0], f1 = db[0], hmin = d->hmin, hmax = d->hmax;
+    int32_t pI = vgetq_lane_s32(PI[0], 0), pQ = vgetq_lane_s32(PQ[0], 0);
+    for (int64_t t = b0; t < b1; t++) {
+        int lo[2] = {0, 0}, rI, rQ;
+        if (d->shift) dec_low(d, lo);
+        dec_res(d, &rI, &rQ);
+        int32_t xI = vgetq_lane_s32(PI[0], 1), xQ = vgetq_lane_s32(PQ[0], 1);
+        int vI = clampi(pI >> sh, hmin, hmax) + rI;
+        if (out_of_range(d, vI)) return;
+        int vQ = clampi((pQ + c0 * vI) >> sh, hmin, hmax) + rQ;
+        if (out_of_range(d, vQ)) return;
+        pI = xI + a1 * vI + g1 * vQ; pQ = xQ + e1 * vI + f1 * vQ;
+        zp[2 * t] = vI; zp[2 * t + 1] = vQ;
+        dec_out(d, out, 2 * t, vI * d->M + lo[0]);
+        dec_out(d, out, 2 * t + 1, vQ * d->M + lo[1]);
+        int16x4_t V = vset_lane_s16((int16_t)vQ, vdup_n_s16((int16_t)vI), 1);
+        for (int r = 0; r < NR; r++) {
+            int32x4_t nI = vextq_s32(PI[r], r + 1 < NR ? PI[r + 1] : R, 1), nQ = vextq_s32(PQ[r], r + 1 < NR ? PQ[r + 1] : R, 1);
+            if (r & 1) {
+                nI = vmlal_high_lane_s16(nI, CA[r / 2], V, 0); nI = vmlal_high_lane_s16(nI, CB[r / 2], V, 1);
+                nQ = vmlal_high_lane_s16(nQ, DA[r / 2], V, 0); nQ = vmlal_high_lane_s16(nQ, DB[r / 2], V, 1);
+            } else {
+                nI = vmlal_lane_s16(nI, vget_low_s16(CA[r / 2]), V, 0); nI = vmlal_lane_s16(nI, vget_low_s16(CB[r / 2]), V, 1);
+                nQ = vmlal_lane_s16(nQ, vget_low_s16(DA[r / 2]), V, 0); nQ = vmlal_lane_s16(nQ, vget_low_s16(DB[r / 2]), V, 1);
+            }
+            PI[r] = nI; PQ[r] = nQ;
+        }
+    }
+}
+// One instance per register count (K <= 4 NR) so the accumulators stay in registers.
+static void dec_block_neon(DecSt *d, int32_t *zp, int64_t b0, int64_t b1, const int32_t *q, int K, int sh, void *out) {
+    switch ((K + 3) / 4) {
+    case 1: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 1); break;
+    case 2: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 2); break;
+    case 3: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 3); break;
+    case 4: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 4); break;
+    case 5: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 5); break;
+    case 6: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 6); break;
+    case 7: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 7); break;
+    default: dec_block_neon_t(d, zp, b0, b1, q, K, sh, out, 8); break;
+    }
+}
+#endif
 #if IQC_X86
 // Transposed FIR in two zmm registers per predictor: lane j holds the partial prediction for time t+j.
 // Each new (I, Q) pair is added to every lane with one vpdpwssd (int16 pairs x int16 coefficient pairs),
@@ -887,6 +1075,10 @@ int iqc_decode(const uint8_t *in, int64_t len, void *out, int fmt, int64_t n, fl
             if (sh > 30 || l1 * (d->hmax + 1) >= (1ll << 30)) goto done;
 #if IQC_X86
             if (have_avx512vnni()) dec_block_avx512(d, zp, b0, b1, q, K, sh, out);
+            else
+#endif
+#if IQC_NEON
+            if (!simd_disabled()) dec_block_neon(d, zp, b0, b1, q, K, sh, out);
             else
 #endif
             dec_block_generic(d, zp, b0, b1, q, K, sh, out);
