@@ -10,8 +10,9 @@ leaf = 8192, the values iqcodec writes). A change that a version-2 reader could 
 in the stream header, and the readers keep reading version 2. (Version 1, written only by iqcodec 0.1.0, is not
 supported.)
 
-The rules of sections 2 to 4 are normative: a reader rejects a stream that breaks them ("must"). Where a stream is
-corrupt in a way these rules do not catch, the chunk CRC does.
+The rules of sections 2 to 4 are normative: a reader rejects a stream that breaks them ("must"). Corruption that
+these rules do not catch is caught by the chunk CRC, with probability 1 - 2^-32. Decoding is defined for any input
+bytes (4.7), so a reader always reaches the CRC check.
 
 Conventions:
 
@@ -54,7 +55,8 @@ end     = u32 0  u64 total                                                 (12 b
 | K | prediction order, 1 to 32 (iqcodec writes 24) |
 | prec | coefficient precision the encoder aimed at (iqcodec writes 11). Informational: any value, ignored by readers. |
 | leaf | leaf block length L in samples, 1 to 2^20 (iqcodec writes 8192) |
-| scale | fc32: values are int16 / scale; a reader must check that scale > 0, scale < 1e30 compared in binary32 (scale < 0x7149F2CA as a bit pattern of a positive value), and that `f32(1 / scale)` is greater than 0. iqcodec writes 32767 unless told otherwise. sc16: ignored, any value. |
+| scale | fc32: values are int16 / scale; a reader must check that scale > 0, scale < 1e30 compared in binary32 (scale < 0x7149F2CA as a bit pattern of a positive value), and that `f32(1 / scale)` is finite (so scale is not subnormal: an infinite `inv` would make the output depend on
+the platform's NaN encoding). iqcodec writes 32767 unless told otherwise. sc16: ignored, any value. |
 
 For fc32, compute `inv = f32(1.0 / scale)` once (a binary32 division), then each output value is the binary32
 product `f32(v) * inv` (not `v / scale`). This matches UHD, which converts sc16 to fc32 as `v * (1/32767)`.
@@ -369,8 +371,8 @@ for ch in 0, 1:
 ```
 
 A reader must reject a used table whose frequencies do not add up to exactly 4096, or that gives one of the symbols
-60 to 63 a nonzero frequency (4.5.2). Valid streams never reference an unused table; a reader may reject that, or
-leave it to the CRC. (iqcodec 0.2.x and 0.3.0 checked only that the running sum stays within 4096; 0.3.1 checks the
+60 to 63 a nonzero frequency (4.5.2). A reader must also reject a chunk that references an unused table
+(a symbol with frequency 0); it may do so when the symbol is decoded or at the end of the block. (iqcodec 0.2.x and 0.3.0 checked only that the running sum stays within 4096; 0.3.1 checks the
 full rule. Streams written by any iqcodec satisfy it.)
 
 #### 4.5.2 Symbols
@@ -490,5 +492,5 @@ iqcodec 0.2.0 to 0.3.x write K = 24, prec = 11, leaf = 8192 and scale = 32767 (o
 - choose the split of each superblock and the coefficients by least squares.
 
 None of these choices is needed to decode (the chunk sizes of 2.2, by contrast, are a rule of the format). Readers
-from iqcodec 0.3.1 on accept any K, leaf and prec in the ranges above. 0.2.x and 0.3.0 readers require K = 24 and leaf = 8192. The streams in `tests/fixtures` marked `wrap` use
-other values.
+from iqcodec 0.3.1 on accept any K and leaf in the ranges above, and any prec. 0.2.x and 0.3.0 readers require
+K = 24 and leaf = 8192. The streams in `tests/fixtures` marked `wrap` use other values.

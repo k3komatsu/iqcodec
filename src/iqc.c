@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <float.h>
 #include <math.h>
 #include <pthread.h>
 #include "iqc.h"
@@ -585,7 +586,7 @@ void iqc_quantize(const float *x, int64_t nvals, float scale, float *out) {
 }
 static int bad_params(int fmt, int64_t n, float scale, int shift, int K, int BL) {
     return (fmt != IQC_FC32 && fmt != IQC_SC16) || n < 0 || n > IQC_MAX_N ||
-           (fmt == IQC_FC32 && (!(scale > 0) || !(1.0f / scale > 0) || !(scale < 1e30f))) ||   // scale unused for sc16
+           (fmt == IQC_FC32 && (!(scale > 0) || !(1.0f / scale <= FLT_MAX) || !(scale < 1e30f))) ||   // scale unused for sc16
            shift < 0 || shift > 3 || K < 1 || K > 32 || BL < 1 || BL > (1 << 20);
 }
 
@@ -873,7 +874,9 @@ ALWAYS_INLINE void dec_low(DecSt *d, int lo[2]) {
 ALWAYS_INLINE int dec_sym(DecSt *d, int ch, int c) {
     uint32_t xv = d->xs[ch], sl = xv & (PROB_SCALE - 1);
     int sy = d->lut[ch][c][sl];
-    xv = d->tab[ch][c].freq[sy] * (xv >> PROB_BITS) + sl - d->tab[ch][c].start[sy];
+    uint32_t f = d->tab[ch][c].freq[sy];
+    d->err |= !f;   // an unused table (FORMAT.md 4.5.1); checked after the block
+    xv = f * (xv >> PROB_BITS) + sl - d->tab[ch][c].start[sy];
     if (xv < RANS_L && d->rp + 2 <= d->rend) { xv = (xv << 16) | d->rp[0] | d->rp[1] << 8; d->rp += 2; }
     d->xs[ch] = xv;
     return res_from(sy, &d->rr);

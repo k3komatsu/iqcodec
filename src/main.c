@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -650,7 +651,7 @@ int main(int argc, char **argv) {
             break;
         case 's':
             scale = strtof(optarg, &end);
-            if (*end || end == optarg || !(scale > 0) || !(scale < 1e30f) || !(1.0f / scale > 0)) {   // library limits
+            if (*end || end == optarg || !(scale > 0) || !(scale < 1e30f) || !(1.0f / scale <= FLT_MAX)) {   // library limits
                 msg("bad scale %s\n", optarg); return 2;
             }
             break;
