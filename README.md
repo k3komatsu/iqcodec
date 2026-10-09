@@ -40,7 +40,8 @@ uhd_rx_cfile ... | iqcodec c - out.iqc   # stdin / stdout with -
 ```
 
 **Part of a capture.** `--skip N --count M` decodes samples N to N+M-1 (complex samples, from 0). Only the
-chunks that overlap the range are read and checked, so this is fast anywhere in a large file:
+chunks that overlap the range are read and checked, so this is fast anywhere in a large file. If the stream
+ends inside the range, the exit status is 3.
 
 ```sh
 iqcodec d --skip 70000000 --count 1000000 capture.iqc part.dat
@@ -48,19 +49,21 @@ iqcodec d --skip 70000000 --count 1000000 capture.iqc part.dat
 
 **Damaged files.** `d --salvage` decodes what it can: a chunk that fails its checksum becomes zeros (and is
 reported), and a truncated or damaged stream ends at the last good chunk. The exit status is 3 when anything
-was lost, and OUTPUT is kept. This also recovers the temporary file (`.iqcodec-XXXXXX`) that a killed or
-powered-off recording leaves behind. `t --salvage` lists every bad chunk.
+was lost, and OUTPUT is kept. This also recovers the temporary file (`.iqcodec-XXXXXX`) that a recording killed with
+SIGKILL or by a power failure leaves behind, up to its last fully written chunk. `t --salvage` lists every bad chunk.
 
 **SigMF.** For `NAME.sigmf-data`, the input format comes from `core:datatype` in `NAME.sigmf-meta`
 (`cf32_le` or `ci16_le`) unless `-f` is given.
 
 Without OUTPUT, `c` writes INPUT.iqc and `d` strips `.iqc`, and neither replaces an existing file. `--rm`
-removes INPUT only after success into a regular file (`c --rm` implies `-t`). On a terminal, progress is
+removes INPUT only after success into a regular file that has been synced to disk, and only if INPUT is still
+the same file, unchanged in size (`c --rm` implies `-t`; it refuses `-l` and symbolic links). On a terminal, progress is
 shown on stderr.
 
 **Recording through a pipe.** When INPUT is a pipe or other stream, Ctrl-C does not throw the capture away.
 The first Ctrl-C lets iqcodec read on until the recorder closes the pipe, then finish the file. A second Ctrl-C
-stops reading at once and finishes the file with what has arrived, and a third aborts. A partial last sample is dropped with a warning. The
+stops reading at once and finishes the file with what has arrived, and a third aborts. SIGHUP (a closed
+terminal or SSH session) and SIGTERM also finish the file. A partial last sample is dropped with a warning. The
 recorder must write only samples to the pipe; status messages belong on stderr.
 
 | option | |

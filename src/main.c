@@ -48,12 +48,13 @@ static void usage(FILE *f) {
         "  --skip N  with d / t: start at sample N (complex samples, counted from 0)\n"
         "  --count N with d / t: at most N samples; only the chunks covering the range are read\n"
         "  --salvage with d / t: keep going past damage: a corrupt chunk becomes zeros, a truncated or damaged\n"
-        "            stream ends at the last good chunk (exit status 3 when anything was lost; OUTPUT is kept)\n"
+        "            stream ends at the last good chunk; OUTPUT is kept\n"
         "  -h, -V    help, version\n\n"
         "A file OUTPUT is written to a temporary file and renamed when complete, so an existing file is\n"
         "replaced only on success (stdout, pipes and devices receive data as it is decoded). INPUT and\n"
         "OUTPUT must not be the same file. A default OUTPUT never replaces an existing file.\n"
-        "Options go before INPUT / OUTPUT.\n");
+        "Options go before INPUT / OUTPUT. Exit status: 0 success, 1 error, 2 usage, 3 incomplete output\n"
+        "(--salvage replaced or dropped data, or the stream ends inside the --skip / --count range).\n");
 }
 
 static void put32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
@@ -94,12 +95,13 @@ static volatile sig_atomic_t graceful_int;   // compressing a stream: Ctrl-C fin
 static volatile sig_atomic_t n_int;          // SIGINTs received in graceful mode
 static volatile sig_atomic_t in_fd = -1;     // that stream
 
+// While recording from a stream, SIGHUP and SIGTERM act like a second Ctrl-C: the capture is finished, not lost.
 static void on_signal(int sig) {
-    if (sig == SIGINT && graceful_int && n_int < 2) {
+    if (graceful_int && n_int < 2 && (sig == SIGINT || sig == SIGHUP || sig == SIGTERM)) {
         static const char m1[] = "\niqcodec: interrupted: finishing when the input ends "
                                  "(Ctrl-C again: stop reading now; a third time: abort)\n";
         static const char m2[] = "\niqcodec: stopped reading, finishing the file\n";
-        n_int++;
+        n_int = sig == SIGINT ? n_int + 1 : 2;
         int e = errno, z;
         ssize_t r = n_int == 1 ? write(STDERR_FILENO, m1, sizeof m1 - 1) : write(STDERR_FILENO, m2, sizeof m2 - 1);
         // second: the input becomes /dev/null, so a read blocked on a stalled producer (resumed by SA_RESTART)
@@ -201,24 +203,41 @@ static FILE *open_output(const char *op, FILE *in) {
     return f;
 }
 // Closes OUTPUT; on success syncs and moves the temporary file into place, otherwise removes it.
+static int no_replace;   // OUTPUT was chosen by iqcodec: never replace a file that appears meanwhile
+static int out_synced;   // the renamed OUTPUT and its directory entry reached the disk
+static int full_sync(int fd) {
+#ifdef F_FULLFSYNC
+    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;   // macOS: fsync alone leaves data in the drive cache
+#endif
+    return fsync(fd);
+}
+// rename() that fails with EEXIST instead of replacing (link() where the file system has it)
+static int rename_new(const char *from, const char *to) {
+    struct stat st;
+    if (link(from, to) == 0) return unlink(from), 0;
+    if (errno == EEXIST) return -1;
+    if (lstat(to, &st) == 0) { errno = EEXIST; return -1; }
+    return rename(from, to);
+}
 static int close_output(FILE *out, const char *op, int ok) {
     if (out == stdout) {
         if (fflush(out) != 0) { if (ok) msg("write error: %s\n", strerror(errno)); return 0; }
         return ok;
     }
-    if (ok && tmp_path[0] && (fflush(out) != 0 || fsync(fileno(out)) != 0)) {
+    out_synced = 0;
+    if (ok && tmp_path[0] && (fflush(out) != 0 || full_sync(fileno(out)) != 0)) {
         msg("%s: %s\n", op, strerror(errno)); ok = 0;
     }
     if (fclose(out) != 0) { if (ok) msg("%s: %s\n", op, strerror(errno)); ok = 0; }
     if (tmp_path[0]) {
-        if (ok && rename(tmp_path, dst_path) != 0) { msg("%s: %s\n", op, strerror(errno)); ok = 0; }
+        if (ok && (no_replace ? rename_new(tmp_path, dst_path) : rename(tmp_path, dst_path)) != 0) { msg("%s: %s\n", op, strerror(errno)); ok = 0; }
         if (!ok) unlink(tmp_path);
         else {   // make the rename itself durable (best effort)
             char dir[PATH_MAX];
             const char *slash = strrchr(dst_path, '/');
             snprintf(dir, sizeof dir, "%.*s", slash ? (int)(slash - dst_path) + 1 : 1, slash ? dst_path : ".");
             int dfd = open(dir, O_RDONLY);
-            if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
+            if (dfd >= 0) { out_synced = full_sync(dfd) == 0; close(dfd); }
         }
         tmp_path[0] = 0;
     }
@@ -522,8 +541,10 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
         printf("format   %s (int16 / %g)\nsamples  %llu (%llu bytes)\nchunks   %llu\nsize     %llu bytes (%.2f%%)\n",
                fmt == IQC_FC32 ? "fc32" : "sc16", scale, (unsigned long long)have, (unsigned long long)(have * ssz),
                (unsigned long long)nchunks, (unsigned long long)csize, have ? 100.0 * csize / (have * ssz) : 0);
-    } else if ((lim != UINT64_MAX && tot < lim - skip) || (have < skip && lim > skip))
+    } else if ((lim != UINT64_MAX && tot < lim - skip) || (have < skip && lim > skip)) {
+        lost = 1;
         msg("the stream ends inside the requested range (%llu samples)\n", (unsigned long long)tot);
+    }
     if (verbose && !info)
         fprintf(stderr, "%llu samples (%llu bytes) %s, %.2f s, checksums verified\n", (unsigned long long)tot,
                 (unsigned long long)(tot * ssz), out ? "written" : "OK", now() - t0);
@@ -628,9 +649,14 @@ int main(int argc, char **argv) {
         }
         struct stat st;
         if (lstat(auto_op, &st) == 0) { msg("%s already exists\n", auto_op); return 1; }
-        op = auto_op;
+        if (errno != ENOENT) { msg("%s: %s\n", auto_op, strerror(errno)); return 1; }
+        op = auto_op; no_replace = 1;
     }
-    if (rm && !strcmp(ip, "-")) { msg("--rm needs a file INPUT\n"); return 2; }
+    if (rm) {   // only a plain file that is exactly recoverable from OUTPUT
+        struct stat st;
+        if (lossy) { msg("--rm cannot be used with -l (the original would not be recoverable)\n"); return 2; }
+        if (!strcmp(ip, "-") || lstat(ip, &st) != 0 || !S_ISREG(st.st_mode)) { msg("--rm needs a regular file INPUT (not a link)\n"); return 2; }
+    }
     if (cmd == CMD_C && fmt < 0 && strlen(ip) > 11 && !strcmp(ip + strlen(ip) - 11, ".sigmf-data") && (fmt = sigmf_format(ip)) < 0) return 2;
     if (fmt < 0) fmt = IQC_FC32;
     if (rm && cmd == CMD_C) verify = 1;   // nothing is deleted that has not been decoded and compared
@@ -652,7 +678,14 @@ int main(int argc, char **argv) {
     int stream = !(fstat(fileno(in), &ist) == 0 && S_ISREG(ist.st_mode));
     int rc = cmd == CMD_D ? decompress(in, out, nth, verbose, skip, lim, 0, salvage) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
     if (!close_output(out, op, rc == 0 || rc == 3)) rc = 1;
+    if (rm && rc == 0) {   // INPUT must still be the file that was read, all of it, and OUTPUT on disk
+        struct stat a, b;
+        if (!(fstat(fileno(in), &a) == 0 && lstat(ip, &b) == 0 && same_file(&a, &b) && a.st_size == ftello(in))) {
+            msg("%s changed during the run: not removed\n", ip); rc = 1;
+        } else if (!out_synced) {
+            msg("%s: could not sync the directory of OUTPUT: %s not removed\n", op, ip); rc = 1;
+        } else if (unlink(ip)) { msg("cannot remove %s: %s\n", ip, strerror(errno)); rc = 1; }
+    }
     if (in != stdin) fclose(in);
-    if (rm && rc == 0 && !stream && unlink(ip)) { msg("cannot remove %s: %s\n", ip, strerror(errno)); rc = 1; }
     return rc;
 }

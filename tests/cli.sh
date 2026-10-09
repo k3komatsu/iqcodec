@@ -43,7 +43,9 @@ fi
 
 # sample ranges: chunk boundaries (2^21), the end of the stream, pipes (no seeking)
 range() {   # usage: range SKIP COUNT [extra d args]: compares with the same bytes of a.fc32
-  "$BIN" d --skip "$1" --count "$2" "$T/a.iqc" "$T/r.out" 2>/dev/null
+  if "$BIN" d --skip "$1" --count "$2" "$T/a.iqc" "$T/r.out" 2>/dev/null; then rc=0; else rc=$?; fi
+  want=0; if [ $(($1 + $2)) -gt 5000000 ]; then want=3; fi          # 3: the stream ends inside the range
+  [ $rc = $want ] || fail "range $1 $2: status $rc"
   tail -c +$(($1 * 8 + 1)) "$T/a.fc32" | head -c $(($2 * 8)) | cmp - "$T/r.out" || fail "range $1 $2"
 }
 range 0 10; range 2097150 5; range 2097152 1; range 100 4194304; range 4999990 100; range 7000000 5
@@ -126,13 +128,18 @@ sleep 0.5; kill -HUP $pid
 wait $pid || fail "ignored SIGHUP killed the run"
 "$BIN" d "$T/h.iqc" "$T/h.out"
 cmp "$T/h.out" "$T/b.sc16"
-(sleep 2; cat "$T/b.sc16") > "$T/fifo" &                    # (background jobs start with INT/QUIT ignored)
-"$BIN" c -f sc16 "$T/fifo" "$T/q.iqc" & pid=$!
-sleep 0.5; kill -TERM $pid
-if wait $pid; then fail "SIGTERM did not stop the run"; fi
-wait
-no_temp SIGTERM
+stall() { cat "$T/b.sc16"; sleep 5; }                                  # writes, then keeps the pipe open
+stall | perl -e '$SIG{QUIT} = "DEFAULT"; exec @ARGV or die' "$BIN" c -f sc16 - "$T/q.iqc" & pid=$!
+sleep 1; kill -QUIT $pid
+if wait $pid; then fail "SIGQUIT did not stop the run"; fi
+no_temp SIGQUIT
 test ! -e "$T/q.iqc" || fail "output created by an interrupted run"
+for sig in TERM HUP; do                                                # a recording is finished, not lost
+  stall | "$BIN" c -f sc16 - "$T/q.iqc" 2>/dev/null & pid=$!
+  sleep 1; kill -$sig $pid
+  wait $pid || fail "SIG$sig lost a recording"
+  "$BIN" d "$T/q.iqc" "$T/q.out"; cmp "$T/q.out" "$T/b.sc16"; rm "$T/q.iqc"
+done
 if (ulimit -f 20; exec "$BIN" c -f sc16 "$T/b.sc16" "$T/f.iqc") 2>/dev/null; then fail "file size limit ignored"; fi
 no_temp SIGXFSZ
 
@@ -140,7 +147,6 @@ no_temp SIGXFSZ
 # restores the default SIGINT that background jobs of a script start without and execs iqcodec in the same
 # process (so $! is iqcodec). Run with a file size limit and a watchdog: these producers never end on their own.
 fast() { while :; do cat "$T/b.sc16" || exit; sleep 0.05; done; }   # endless, about 20 MB/s
-stall() { cat "$T/b.sc16"; sleep 5; }                                  # writes, then keeps the pipe open
 live() (   # usage: live PRODUCER OUT N_INTS GAP
   ulimit -f 409600
   $1 | perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' "$BIN" c -f sc16 - "$2" & pid=$!
@@ -173,6 +179,10 @@ must_fail "$BIN" d "$T/n/x.sc16.iqc"                              # x.sc16 exist
 rm "$T/n/x.sc16"; "$BIN" d --rm "$T/n/x.sc16.iqc"
 test ! -e "$T/n/x.sc16.iqc" || fail "d --rm kept its input"
 cmp "$T/n/x.sc16" "$T/b.sc16"
+cp "$T/n/x.sc16" "$T/n/x2.sc16"; ln -s x2.sc16 "$T/n/lnk"
+must_fail "$BIN" c --rm -f sc16 "$T/n/lnk"                        # not through a symlink
+must_fail "$BIN" c --rm -l -f sc16 "$T/n/x2.sc16"                 # not when lossy
+test -e "$T/n/x2.sc16" || fail "--rm removed a refused input"
 "$BIN" c --rm -f sc16 "$T/n/x.sc16"
 test ! -e "$T/n/x.sc16" || fail "c --rm kept its input"
 must_fail "$BIN" d --rm "$T/n/x.sc16.iqc" /dev/null
