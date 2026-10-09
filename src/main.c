@@ -44,6 +44,8 @@ static void usage(FILE *f) {
         "  -v        print statistics\n"
         "  --skip N  with d / t: start at sample N (complex samples, counted from 0)\n"
         "  --count N with d / t: at most N samples; only the chunks covering the range are read\n"
+        "  --salvage with d / t: keep going past damage: a corrupt chunk becomes zeros, a truncated or damaged\n"
+        "            stream ends at the last good chunk (exit status 3 when anything was lost; OUTPUT is kept)\n"
         "  -h, -V    help, version\n\n"
         "A file OUTPUT is written to a temporary file and renamed when complete, so an existing file is\n"
         "replaced only on success (stdout, pipes and devices receive data as it is decoded). INPUT and\n"
@@ -390,8 +392,9 @@ done:
 
 // out == NULL: test only. Samples [skip, lim) only: chunks before skip are passed over (seeked when possible), and
 // reading stops at the first chunk past lim, so only the chunks that overlap the range are decoded and verified.
-// info: print what the headers say and decode nothing.
-static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, uint64_t lim, int info) {
+// info: print what the headers say and decode nothing. salvage: a chunk that fails its checksum becomes zeros, and a
+// truncated or damaged stream ends at the last good chunk; returns 3 when anything was lost.
+static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, uint64_t lim, int info, int salvage) {
     uint8_t hdr[16];
     if (read_full(in, hdr, 16) != 16 || memcmp(hdr, MAGIC, 4) || hdr[4] != 2 || hdr[5] > 1 || hdr[6] != K_ORDER || get32(hdr + 8) != LEAF) {
         fprintf(stderr, "iqcodec: not an iqcodec stream (or an unsupported version)\n");
@@ -400,8 +403,9 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
     int fmt = hdr[5];
     float scale; memcpy(&scale, hdr + 12, 4);
     size_t ssz = ssize_of(fmt);
-    int ns = nth + 2, state[MAX_SLOTS] = {0}, nrun = 0, rc = 1, eof = 0;
+    int ns = nth + 2, state[MAX_SLOTS] = {0}, nrun = 0, rc = 1, eof = 0, lost = 0;
     uint64_t nchunks = 0, csize = 16 + 12;
+    const char *why;
     if (info) skip = lim = UINT64_MAX;
     Job jobs[MAX_SLOTS];
     pthread_t th[MAX_TH];
@@ -419,28 +423,34 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
         if (!eof && have >= lim) eof = 1;
         if (!eof && rd - wr < ns) {
             uint8_t ch[16];
-            if (read_full(in, ch, 4) != 4) goto trunc;
+            why = "truncated input";
+            if (read_full(in, ch, 4) != 4) goto bad;
             uint32_t n = get32(ch);
             if (!n) {   // end marker: total sample count, then nothing
                 uint8_t t[8];
-                if (read_full(in, t, 8) != 8) goto trunc;
+                if (read_full(in, t, 8) != 8) goto bad;
                 uint64_t want = get32(t) | (uint64_t)get32(t + 4) << 32;
-                if (want != have) { fprintf(stderr, "iqcodec: sample count mismatch (%llu expected, %llu found)\n", (unsigned long long)want, (unsigned long long)have); goto fail; }
-                if (fgetc(in) != EOF) { fprintf(stderr, "iqcodec: unexpected data after the end of the stream\n"); goto fail; }
+                why = "sample count mismatch (corrupt end marker or missing chunks)";
+                if (want != have) goto bad;
+                why = "unexpected data after the end of the stream";
+                if (fgetc(in) != EOF) goto bad;
                 if (ferror(in)) { fprintf(stderr, "iqcodec: read error: %s\n", strerror(errno)); goto fail; }
                 eof = 1;
             } else {
-                if (read_full(in, ch + 4, 12) != 12) goto trunc;
+                if (read_full(in, ch + 4, 12) != 12) goto bad;
                 uint32_t sz = get32(ch + 8);
-                if (n > CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto corrupt;
+                why = "corrupt chunk header";
+                if (n > CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto bad;
+                why = "truncated input";
                 nchunks++; csize += 16 + (uint64_t)sz;
                 if (have + n <= skip) {   // before the range
                     have += n;
                     if (seekable) { if (fseeko(in, sz, SEEK_CUR)) { fprintf(stderr, "iqcodec: seek error: %s\n", strerror(errno)); goto fail; } continue; }
                     for (uint32_t left = sz, m; left; left -= m) {   // not seekable: read it
                         m = left < sizeof skipbuf ? left : (uint32_t)sizeof skipbuf;
-                        if (read_full(in, skipbuf, m) != m) goto trunc;
+                        if (read_full(in, skipbuf, m) != m) break;
                     }
+                    if (feof(in) || ferror(in)) goto bad;
                     continue;
                 }
                 int k = (int)(rd % ns);
@@ -448,19 +458,30 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
                 if (sz > j->cap) { free(j->enc); j->cap = sz; j->enc = malloc(sz); }
                 if ((int64_t)n > rawcap[k]) { free(j->raw); rawcap[k] = n; j->raw = malloc((size_t)n * ssz); }
                 if (!j->enc || !j->raw) { fprintf(stderr, "iqcodec: out of memory\n"); goto fail; }
-                if (read_full(in, j->enc, sz) != sz) goto trunc;
+                if (read_full(in, j->enc, sz) != sz) goto bad;
                 j->n = n; j->size = sz; j->shift = ch[4]; j->fmt = fmt; j->scale = scale; j->crc = get32(ch + 12); j->first = have;
                 have += n;
                 set_state(&pl, k, S_READY); rd++;
                 if (rd - wr < ns && get_state(&pl, (int)(wr % ns)) != S_DONE) continue;   // keep reading ahead
+            }
+            if (0) {
+            bad:   // the stream itself is damaged: give up, or with salvage keep what came before
+                if (ferror(in)) { fprintf(stderr, "iqcodec: read error: %s\n", strerror(errno)); goto fail; }
+                fprintf(stderr, "iqcodec: %s after %llu samples%s\n", why, (unsigned long long)have, salvage ? ": stopping there" : "");
+                if (!salvage) goto fail;
+                lost = 1; eof = 1;
             }
         }
         if (wr == rd) continue;
         int k = (int)(wr % ns);
         wait_done(&pl, k);
         Job *j = &jobs[k];
-        if (j->err == 2) { fprintf(stderr, "iqcodec: chunk %lld: checksum mismatch (corrupt data)\n", (long long)wr); goto fail; }
-        if (j->err) { fprintf(stderr, "iqcodec: chunk %lld: corrupt data\n", (long long)wr); goto fail; }
+        if (j->err) {
+            fprintf(stderr, "iqcodec: samples %llu-%llu: %s%s\n", (unsigned long long)j->first, (unsigned long long)(j->first + j->n - 1),
+                    j->err == 2 ? "checksum mismatch (corrupt data)" : "corrupt data", salvage ? ", replaced by zeros" : "");
+            if (!salvage) goto fail;
+            memset(j->raw, 0, (size_t)j->n * ssz); lost = 1;
+        }
         uint64_t lo = skip > j->first ? skip - j->first : 0, hi = lim - j->first < (uint64_t)j->n ? lim - j->first : (uint64_t)j->n;
         if (out && fwrite((char *)j->raw + lo * ssz, ssz, hi - lo, out) != hi - lo) { fprintf(stderr, "iqcodec: write error: %s\n", strerror(errno)); goto fail; }
         tot += hi - lo;
@@ -475,15 +496,8 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
     if (verbose && !info)
         fprintf(stderr, "%llu samples (%llu bytes) %s, %.2f s, checksums verified\n", (unsigned long long)tot,
                 (unsigned long long)(tot * ssz), out ? "written" : "OK", now() - t0);
-    rc = 0;
-    goto done;
-trunc:
-    fprintf(stderr, "iqcodec: truncated input\n");
-    goto fail;
-corrupt:
-    fprintf(stderr, "iqcodec: chunk %lld: corrupt header\n", (long long)rd);
+    rc = lost ? 3 : 0;
 fail:
-done:
     pool_stop(&pl, th, nrun);
     free_jobs(jobs, ns);
     return rc;
@@ -506,8 +520,9 @@ int main(int argc, char **argv) {
 #endif
     char *end;
     uint64_t skip = 0, count = UINT64_MAX;
-    int ranged = 0;
-    static const struct option longopts[] = {{"skip", required_argument, NULL, 'S'}, {"count", required_argument, NULL, 'C'}, {0, 0, 0, 0}};
+    int ranged = 0, salvage = 0;
+    static const struct option longopts[] = {{"skip", required_argument, NULL, 'S'}, {"count", required_argument, NULL, 'C'},
+                                             {"salvage", no_argument, NULL, 'R'}, {0, 0, 0, 0}};
     while ((opt = getopt_long(argc, argv, optstr, longopts, NULL)) != -1) {
         switch (opt) {
         case 'f':
@@ -537,6 +552,7 @@ int main(int argc, char **argv) {
             ranged = 1;
             break;
         }
+        case 'R': salvage = 1; break;
         case 'v': verbose = 1; break;
         case 'V': puts("iqcodec " VERSION); return 0;
         case 'h': usage(stdout); return 0;
@@ -544,13 +560,13 @@ int main(int argc, char **argv) {
         }
     }
     if (argc - optind != (cmd >= CMD_T ? 1 : 2)) { usage(stderr); return 2; }
-    if (ranged && (cmd == CMD_C || cmd == CMD_I)) { fprintf(stderr, "iqcodec: --skip / --count are for d and t\n"); return 2; }
+    if ((ranged || salvage) && (cmd == CMD_C || cmd == CMD_I)) { fprintf(stderr, "iqcodec: --skip, --count and --salvage are for d and t\n"); return 2; }
     uint64_t lim = count > UINT64_MAX - skip ? UINT64_MAX : skip + count;
     const char *ip = argv[optind], *op = cmd >= CMD_T ? NULL : argv[optind + 1];
     FILE *in = strcmp(ip, "-") ? fopen(ip, "rb") : stdin;
     if (!in) { fprintf(stderr, "iqcodec: %s: %s\n", ip, strerror(errno)); return 1; }
     if (cmd >= CMD_T) {
-        int rc = decompress(in, NULL, nth, verbose, skip, lim, cmd == CMD_I);
+        int rc = decompress(in, NULL, nth, verbose, skip, lim, cmd == CMD_I, salvage);
         if (in != stdin) fclose(in);
         return rc;
     }
@@ -559,8 +575,8 @@ int main(int argc, char **argv) {
     if (!out) { if (in != stdin) fclose(in); return 1; }
     struct stat ist;
     int stream = !(fstat(fileno(in), &ist) == 0 && S_ISREG(ist.st_mode));
-    int rc = cmd == CMD_D ? decompress(in, out, nth, verbose, skip, lim, 0) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
-    if (!close_output(out, op, rc == 0)) rc = 1;
+    int rc = cmd == CMD_D ? decompress(in, out, nth, verbose, skip, lim, 0, salvage) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
+    if (!close_output(out, op, rc == 0 || rc == 3)) rc = 1;
     if (in != stdin) fclose(in);
     return rc;
 }

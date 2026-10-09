@@ -75,11 +75,20 @@ old=$(od -An -tu1 -j $pos -N1 "$T/bad.iqc" | tr -d ' ')
 printf "$(printf '\\%03o' $(( (old + 1) % 256 )))" | dd of="$T/bad.iqc" bs=1 seek=$pos conv=notrunc 2>/dev/null
 must_fail "$BIN" t "$T/bad.iqc"
 "$BIN" t --skip 4194304 "$T/bad.iqc"                             # only the chunks in the range are read
+# --salvage: a bad chunk becomes zeros, the rest is intact, exit status 3, OUTPUT kept
+if "$BIN" d --salvage "$T/bad.iqc" "$T/sv.out" 2>/dev/null; then fail "salvage: no exit status for a loss"; else test $? = 3 || fail "salvage status"; fi
+cmp -s "$T/sv.out" "$T/a.fc32" && fail "salvage: corruption not reported in the data"
+tail -c +$((2097152 * 8 + 1)) "$T/sv.out" > "$T/sv.tail"; tail -c +$((2097152 * 8 + 1)) "$T/a.fc32" | cmp - "$T/sv.tail"
+head -c $((2097152 * 8)) "$T/sv.out" | tr -d '\000' | cmp - /dev/null || fail "salvage: chunk not zeroed"
+"$BIN" d --salvage "$T/a.iqc" "$T/sv.out"; cmp "$T/sv.out" "$T/a.fc32"
 must_fail "$BIN" d "$T/bad.iqc" "$T/bad.out"
 test ! -e "$T/bad.out" || fail "partial output left behind"
 head -c 1000000 "$T/a.iqc" > "$T/short.iqc"
 must_fail "$BIN" t "$T/short.iqc"
 must_fail "$BIN" i "$T/short.iqc"
+"$BIN" d --salvage "$T/short.iqc" "$T/sv.out" 2>/dev/null || test $? = 3 || fail "salvage of a truncated stream"
+head -c $(wc -c < "$T/sv.out") "$T/a.fc32" | cmp - "$T/sv.out"
+test -s "$T/sv.out" || fail "salvage: nothing recovered"
 cat "$T/b.iqc" "$T/b.iqc" > "$T/twice.iqc"
 must_fail "$BIN" t "$T/twice.iqc"
 must_fail "$BIN" d "$T/b.sc16" "$T/g.out"
