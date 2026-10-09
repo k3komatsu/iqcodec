@@ -1,0 +1,9 @@
+# sha256 of the decoded samples, file, and how it was written (c FORMAT: by iqcodec c, so re-encoding must reproduce
+# it byte for byte; wrap: by tests/roundtrip wrap, with K / leaf / shift that iqcodec c does not use)
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 empty.fc32.iqc c fc32
+883c94aa07b9872cc8737cc5d82ea71c755b0663d2dd60a63d198aef6f142957 k32-leaf65536-shift3.sc16.iqc wrap
+eb94b4afe1706066cbf0da62ec71da6e8a8423f8a58e03f312856fdc41b42111 k7-leaf333-shift1.sc16.iqc wrap
+e69d9797fe5cfd72f9cd07b9b3e74fd97ba9bf217b7dcc1be0876591b71dbf63 tone-sd.fc32.iqc c fc32
+935b18036c1bbc19cb2733fc0a38d833d0f805db9f8ec14ad7acee388c8c4327 tone.sc16.iqc c sc16
+57d9ced1581a4f108f6a6df9cf81d454231bc1ed2c10d259211149f77a95ec4b two-chunks.sc16.iqc c sc16
+4853f50b259eecaf3ff2b641ecbdc15b4d59da3cc6a0c4701bda603dff9018c7 white.sc16.iqc c sc16

@@ -41,7 +41,8 @@ static void usage(FILE *f) {
         "            for NAME.sigmf-data the default comes from core:datatype in NAME.sigmf-meta\n"
         "  -s SCALE  fc32 values are int16 / SCALE (default 32767, as UHD converts sc16 to fc32)\n"
         "  -l        lossy: allow fc32 input that is not exactly int16 / SCALE (it is quantized)\n"
-        "  -t        with c: decode every chunk right after encoding and compare with the input\n"
+        "  -t        with c: decode every chunk right after encoding and compare with the input; a file\n"
+        "            OUTPUT is then also read back and tested (checksums, sample count)\n"
         "  -j N      threads (default: number of CPUs, at most 8)\n"
         "  -v        print statistics\n"
         "  --rm      remove INPUT after success (c implies -t)\n"
@@ -132,6 +133,14 @@ static void install_signal_handlers(void) {
     }
 }
 
+// Best effort: make the next reads come from the device, not from pages cached when the file was written.
+static void drop_cache(int fd) {
+#if defined(F_NOCACHE)
+    (void)fcntl(fd, F_NOCACHE, 1);
+#elif defined(POSIX_FADV_DONTNEED)
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+}
 static int same_file(const struct stat *a, const struct stat *b) { return a->st_dev == b->st_dev && a->st_ino == b->st_ino; }
 // Not written to (mtime) and no metadata change (ctime) between two stats of one file.
 static int same_times(const struct stat *a, const struct stat *b) {
@@ -268,7 +277,7 @@ static int close_output(FILE *out, const char *op, int ok) {
 
 // ---------------- chunk jobs ----------------
 typedef struct {
-    int fmt, shift, verify; float scale;
+    int fmt, shift, verify, K, leaf; float scale;
     void *raw; int64_t n;             // samples
     uint64_t first;                   // d: index of the chunk's first sample in the stream
     uint8_t *enc; int64_t size, cap;  // coded chunk
@@ -301,7 +310,7 @@ static void *enc_job(void *p) {
 }
 static void *dec_job(void *p) {
     Job *j = p;
-    j->err = iqc_decode(j->enc, j->size, j->raw, j->fmt, j->n, j->scale, j->shift, K_ORDER, LEAF) != 0;
+    j->err = iqc_decode(j->enc, j->size, j->raw, j->fmt, j->n, j->scale, j->shift, j->K, j->leaf) != 0;
     if (!j->err && crc32c(0, j->raw, (size_t)j->n * ssize_of(j->fmt)) != j->crc) j->err = 2;
     return NULL;
 }
@@ -392,7 +401,7 @@ static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int ve
     memcpy(hdr, MAGIC, 4); hdr[4] = 2; hdr[5] = (uint8_t)fmt; hdr[6] = K_ORDER; hdr[7] = PREC;
     put32(hdr + 8, LEAF); memcpy(hdr + 12, &scale, 4);
     if (fwrite(hdr, 1, 16, out) != 16) goto werr;
-    int shift = -1, eof = 0;
+    int shift = -1, eof = 0, partial = 0;   // partial: a trailing partial sample was dropped (exit 3)
     int64_t tot_in = 0, tot_out = 16, tot_inexact = 0, rd = 0, wr = 0;
     uint64_t tot_samples = 0;
     double t0 = now();
@@ -409,6 +418,7 @@ static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int ve
             if (got % ssz) {
                 if (!stream) { msg("input size is not a multiple of %zu bytes\n", ssz); goto fail; }
                 msg("input ended inside a sample: %zu trailing bytes dropped\n", got % ssz);
+                partial = 1;
                 got -= got % ssz;
                 eof = 1;
             }
@@ -449,7 +459,7 @@ static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int ve
         fprintf(stderr, "%lld -> %lld bytes (%.2f%%, %.3fx), %.2f s%s%s%s\n", (long long)tot_in, (long long)tot_out,
                 tot_in ? 100.0 * tot_out / tot_in : 0, tot_out ? (double)tot_in / tot_out : 0, now() - t0,
                 verify ? ", verified" : "", tot_inexact ? " (lossy: values quantized)" : "", n_int ? " (stopped early by a signal)" : "");
-    rc = 0;
+    rc = partial ? 3 : 0;
     goto done;
 werr:
     msg("write error: %s\n", strerror(errno));
@@ -467,7 +477,9 @@ done:
 // truncated or damaged stream ends at the last good chunk; returns 3 when anything was lost.
 static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, uint64_t lim, int info, int salvage) {
     uint8_t hdr[16];
-    if (read_full(in, hdr, 16) != 16 || memcmp(hdr, MAGIC, 4) || hdr[4] != 2 || hdr[5] > 1 || hdr[6] != K_ORDER || get32(hdr + 8) != LEAF) {
+    // K and the leaf block length come from the header (any value the library accepts), prec is informational
+    if (read_full(in, hdr, 16) != 16 || memcmp(hdr, MAGIC, 4) || hdr[4] != 2 || hdr[5] > 1 || hdr[6] < 1 || hdr[6] > 32 ||
+        get32(hdr + 8) < 1 || get32(hdr + 8) > (1 << 20)) {
         msg("not an iqcodec stream (or an unsupported version)\n");
         return 1;
     }
@@ -513,7 +525,7 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
                 uint32_t sz = get32(ch + 8);
                 why = "corrupt chunk header";
                 // every chunk but the last is full, so a damaged n cannot shift the samples that follow
-                if (n > CHUNK || prev_n != CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto bad;
+                if (n > CHUNK || prev_n != CHUNK || ch[4] > 3 || ch[5] || ch[6] || ch[7] || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto bad;
                 prev_n = n;
                 why = "truncated input";
                 nchunks++; csize += 16 + (uint64_t)sz;
@@ -534,6 +546,7 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
                 if (!j->enc || !j->raw) { msg("out of memory\n"); goto fail; }
                 if (read_full(in, j->enc, sz) != sz) goto bad;
                 j->n = n; j->size = sz; j->shift = ch[4]; j->fmt = fmt; j->scale = scale; j->crc = get32(ch + 12); j->first = have;
+                j->K = hdr[6]; j->leaf = (int)get32(hdr + 8);
                 have += n;
                 set_state(&pl, k, S_READY); rd++;
                 if (rd - wr < ns && get_state(&pl, (int)(wr % ns)) != S_DONE) continue;   // keep reading ahead
@@ -709,7 +722,14 @@ int main(int argc, char **argv) {
     struct stat ist;
     int stream = !(fstat(fileno(in), &ist) == 0 && S_ISREG(ist.st_mode));
     int rc = cmd == CMD_D ? decompress(in, out, nth, verbose, skip, lim, 0, salvage) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
+    int to_file = tmp_path[0] != 0;   // close_output clears it
     if (!close_output(out, op, rc == 0 || rc == 3)) rc = 1;
+    if (cmd == CMD_C && verify && to_file && (rc == 0 || rc == 3)) {   // -t: also read the written file back and test it
+        FILE *v = fopen(dst_path, "rb");
+        if (v) drop_cache(fileno(v));
+        if (!v || decompress(v, NULL, nth, 0, 0, UINT64_MAX, 0, 0) != 0) { msg("%s: the written file does not test OK\n", op); rc = 1; }
+        if (v) fclose(v);
+    }
     if (rm && rc == 0) {   // INPUT must still be the file that was read, all of it, and OUTPUT on disk
         struct stat a, b;
         if (!(fstat(fileno(in), &a) == 0 && lstat(ip, &b) == 0 && same_file(&a, &b) && a.st_size == ftello(in) &&

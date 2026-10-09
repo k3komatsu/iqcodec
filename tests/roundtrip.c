@@ -1,6 +1,9 @@
 // Round-trip check of the chunk codec on synthetic signals, both sample formats and every shift.
 // Usage: roundtrip               run the checks (exit 1 on the first failure)
-//        roundtrip gen N FILE    write N fc32 samples (tone + sigma-delta low bits, exact int16/32767)
+//        roundtrip gen N FILE [SIGNAL [sc16]]   write N samples of signal 0-7 (default 5: tone + sigma-delta low
+//                                bits), fc32 (exact int16/32767) or sc16
+//        roundtrip wrap K LEAF SHIFT IN.sc16 OUT.iqc   write a stream with any K / leaf length / shift (for testing
+//                                readers; iqcodec itself writes K 24, leaf 8192 and picks the shift)
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,16 +107,43 @@ static int robustness(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 4 && !strcmp(argv[1], "gen")) {
+    if (argc >= 4 && argc <= 6 && !strcmp(argv[1], "gen")) {
         int64_t n = atoll(argv[2]);
+        int sig = argc > 4 ? atoi(argv[4]) : 5, sc16 = argc > 5 && !strcmp(argv[5], "sc16");
         int16_t *x = malloc(n * 4);
         float *f = malloc(n * 8);
-        make(5, x, n);
+        make(sig, x, n);
         for (int64_t i = 0; i < 2 * n; i++) f[i] = (float)x[i] * (1.0f / 32767.0f);
         FILE *o = fopen(argv[3], "wb");
-        int bad = !o || fwrite(f, 8, n, o) != (size_t)n || fclose(o);
+        int bad = !o || (sc16 ? fwrite(x, 4, n, o) : fwrite(f, 8, n, o)) != (size_t)n || fclose(o);
         free(x); free(f);
         return bad;
+    }
+    if (argc == 7 && !strcmp(argv[1], "wrap")) {   // the container of FORMAT.md around iqc_encode chunks
+        int K = atoi(argv[2]), leaf = atoi(argv[3]), shift = atoi(argv[4]);
+        enum { CH = 1 << 21 };
+        FILE *in = fopen(argv[5], "rb"), *o = fopen(argv[6], "wb");
+        int16_t *x = malloc((size_t)CH * 4);
+        uint8_t *buf = malloc((size_t)CH * 8 + (1 << 20)), h[16] = {'I', 'Q', 'C', 'D', 2, IQC_SC16, (uint8_t)K, 11};
+        float scale = 32767.f;
+        uint64_t tot = 0;
+        int64_t m, inexact;
+        if (!in || !o || !x || !buf) return 1;
+        h[8] = leaf; h[9] = leaf >> 8; h[10] = leaf >> 16; h[11] = leaf >> 24; memcpy(h + 12, &scale, 4);
+        fwrite(h, 1, 16, o);
+        while ((m = (int64_t)fread(x, 4, CH, in)) > 0) {
+            int64_t sz = iqc_encode(x, IQC_SC16, m, scale, shift, K, leaf, 11, buf, (int64_t)CH * 8 + (1 << 20), &inexact);
+            uint32_t c = crc32c(0, x, (size_t)m * 4), hd[4] = {(uint32_t)m, (uint32_t)shift, (uint32_t)sz, c};
+            if (sz < 0) return 1;
+            for (int i = 0; i < 16; i++) h[i] = (uint8_t)(hd[i / 4] >> (8 * (i % 4)));   // little-endian u32s
+            fwrite(h, 1, 16, o); fwrite(buf, 1, (size_t)sz, o);
+            tot += (uint64_t)m;
+        }
+        memset(h, 0, 12);
+        for (int i = 0; i < 8; i++) h[4 + i] = (uint8_t)(tot >> (8 * i));
+        fwrite(h, 1, 12, o);
+        free(x); free(buf); fclose(in);
+        return fclose(o) != 0;
     }
     {   // CRC-32C: check value, and hardware / table paths against a bitwise reference on odd lengths
         uint8_t b[1027];

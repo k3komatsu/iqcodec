@@ -97,6 +97,8 @@ head -c $(wc -c < "$T/sv.out") "$T/a.fc32" | cmp - "$T/sv.out"
 test -s "$T/sv.out" || fail "salvage: nothing recovered"
 cat "$T/b.iqc" "$T/b.iqc" > "$T/twice.iqc"
 must_fail "$BIN" t "$T/twice.iqc"
+cp "$T/b.iqc" "$T/rsv.iqc"; printf '\001' | dd of="$T/rsv.iqc" bs=1 seek=21 conv=notrunc 2>/dev/null   # reserved byte
+must_fail "$BIN" t "$T/rsv.iqc"
 must_fail "$BIN" d "$T/b.sc16" "$T/g.out"
 { head -c 16 "$T/b.iqc"; printf '\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'; } > "$T/z.iqc"
 if "$BIN" t "$T/z.iqc" 2> "$T/z.err"; then fail "empty chunk accepted"; fi
@@ -176,7 +178,8 @@ mkdir "$T/k"; { cat "$T/a.fc32"; printf 'ABCD\000\000\000\000'; } | "$BIN" c - "
 set -- "$T"/k/.iqcodec-*; test -f "$1" || fail "failed recording not kept"
 "$BIN" d --salvage "$1" "$T/k/rec.out" 2>/dev/null || [ $? = 3 ] || fail "kept recording not salvageable"
 head -c $((4194304 * 8)) "$T/a.fc32" | cmp - "$T/k/rec.out"
-{ cat "$T/b.sc16"; printf x; } | "$BIN" c -f sc16 - "$T/part.iqc" 2>/dev/null   # partial last sample dropped
+# partial last sample: dropped, the rest is kept, exit status 3 (incomplete)
+if { cat "$T/b.sc16"; printf x; } | "$BIN" c -f sc16 - "$T/part.iqc" 2>/dev/null; then fail "partial sample: status 0"; else [ $? = 3 ] || fail "partial sample status"; fi
 "$BIN" d "$T/part.iqc" "$T/part.out"
 cmp "$T/part.out" "$T/b.sc16"
 

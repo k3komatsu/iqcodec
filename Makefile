@@ -14,6 +14,7 @@ tests/roundtrip: tests/roundtrip.c src/iqc.c src/iqc.h src/crc32c.c src/crc32c.h
 test: iqcodec tests/roundtrip
 	./tests/roundtrip
 	sh tests/cli.sh ./iqcodec
+	sh tests/fixtures.sh ./iqcodec
 
 install: iqcodec
 	install -d $(DESTDIR)$(PREFIX)/bin
