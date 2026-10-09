@@ -88,6 +88,7 @@ static void progress(const char *what, uint64_t done, uint64_t total, uint64_t r
 
 // ---------------- output: same-file guard, temporary file + rename ----------------
 static char tmp_path[PATH_MAX + 32];   // non-empty while a temporary output exists
+static volatile sig_atomic_t tmp_fd = -1;
 static char dst_path[PATH_MAX];        // regular-file OUTPUT after following symlinks (rename target)
 
 static const int fatal_sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGXFSZ};
@@ -110,7 +111,13 @@ static void on_signal(int sig) {
         (void)r; errno = e;
         return;
     }
-    if (tmp_path[0]) unlink(tmp_path);
+    struct stat ts;
+    if (tmp_path[0] && graceful_int && fstat(tmp_fd, &ts) == 0 && ts.st_size > 16) {   // a recording cannot be read
+        // again: leave what reached the file for d --salvage
+        static const char m[] = "\niqcodec: partial recording kept in ";
+        ssize_t r = write(STDERR_FILENO, m, sizeof m - 1);
+        r = write(STDERR_FILENO, tmp_path, strlen(tmp_path)); r = write(STDERR_FILENO, "\n", 1); (void)r;
+    } else if (tmp_path[0]) unlink(tmp_path);
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -126,6 +133,16 @@ static void install_signal_handlers(void) {
 }
 
 static int same_file(const struct stat *a, const struct stat *b) { return a->st_dev == b->st_dev && a->st_ino == b->st_ino; }
+// Not written to (mtime) and no metadata change (ctime) between two stats of one file.
+static int same_times(const struct stat *a, const struct stat *b) {
+#ifdef __APPLE__
+    return a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec && a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec &&
+           a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec && a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+#else
+    return a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+           a->st_ctim.tv_sec == b->st_ctim.tv_sec && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+#endif
+}
 
 // Descriptor behind /dev/stdout, /dev/stderr, /dev/fd/N or /proc/self/fd/N, else -1.
 static int fd_alias(const char *p) {
@@ -191,6 +208,7 @@ static FILE *open_output(const char *op, FILE *in) {
     int dl = slash ? (int)(slash - dst_path) + 1 : 0;
     snprintf(tmp_path, sizeof tmp_path, "%.*s.iqcodec-XXXXXX", dl, dst_path);
     int fd = mkstemp(tmp_path);
+    tmp_fd = fd;
     if (fd < 0) {
         msg("%s: cannot create a temporary file in %.*s: %s\n", op, dl ? dl : 1, dl ? dst_path : ".", strerror(errno));
         tmp_path[0] = 0;
@@ -231,7 +249,10 @@ static int close_output(FILE *out, const char *op, int ok) {
     if (fclose(out) != 0) { if (ok) msg("%s: %s\n", op, strerror(errno)); ok = 0; }
     if (tmp_path[0]) {
         if (ok && (no_replace ? rename_new(tmp_path, dst_path) : rename(tmp_path, dst_path)) != 0) { msg("%s: %s\n", op, strerror(errno)); ok = 0; }
-        if (!ok) unlink(tmp_path);
+        struct stat ts;
+        if (!ok && graceful_int && stat(tmp_path, &ts) == 0 && ts.st_size > 16)   // see on_signal
+            msg("partial recording kept in %s (recover it with: iqcodec d --salvage)\n", tmp_path);
+        else if (!ok) unlink(tmp_path);
         else {   // make the rename itself durable (best effort)
             char dir[PATH_MAX];
             const char *slash = strrchr(dst_path, '/');
@@ -377,6 +398,7 @@ static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int ve
     nrun = pool_start(&pl, th, nth);
     if (!nrun) { msg("cannot start threads\n"); goto fail; }
     in_fd = fileno(in); graceful_int = stream;
+    if (stream) signal(SIGPIPE, SIG_IGN);   // a dead stderr reader must not kill a recording (writes just fail)
     while (!eof || wr < rd) {
         if (!eof && rd - wr < ns) {   // read the next chunk into the next slot (free: it was written)
             int k = (int)(rd % ns);
@@ -425,7 +447,7 @@ static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int ve
     if (verbose || n_int)
         fprintf(stderr, "%lld -> %lld bytes (%.2f%%, %.3fx), %.2f s%s%s%s\n", (long long)tot_in, (long long)tot_out,
                 tot_in ? 100.0 * tot_out / tot_in : 0, tot_out ? (double)tot_in / tot_out : 0, now() - t0,
-                verify ? ", verified" : "", tot_inexact ? " (lossy: values quantized)" : "", n_int ? " (stopped by Ctrl-C)" : "");
+                verify ? ", verified" : "", tot_inexact ? " (lossy: values quantized)" : "", n_int ? " (stopped early by a signal)" : "");
     rc = 0;
     goto done;
 werr:
@@ -481,8 +503,8 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
                 uint64_t want = get32(t) | (uint64_t)get32(t + 4) << 32;
                 why = "sample count mismatch (corrupt end marker or missing chunks)";
                 if (want != have) goto bad;
-                why = "unexpected data after the end of the stream";
-                if (fgetc(in) != EOF) { if (!salvage) goto bad; msg("%s (ignored)\n", why); }
+                why = "unexpected data (another stream appended?) at the end of the stream";
+                if (fgetc(in) != EOF) goto bad;   // with salvage a loss too: it may be a second, appended stream
                 if (ferror(in)) { msg("read error: %s\n", strerror(errno)); goto fail; }
                 eof = 1;
             } else {
@@ -689,7 +711,8 @@ int main(int argc, char **argv) {
     if (!close_output(out, op, rc == 0 || rc == 3)) rc = 1;
     if (rm && rc == 0) {   // INPUT must still be the file that was read, all of it, and OUTPUT on disk
         struct stat a, b;
-        if (!(fstat(fileno(in), &a) == 0 && lstat(ip, &b) == 0 && same_file(&a, &b) && a.st_size == ftello(in))) {
+        if (!(fstat(fileno(in), &a) == 0 && lstat(ip, &b) == 0 && same_file(&a, &b) && a.st_size == ftello(in) &&
+              a.st_size == ist.st_size && same_times(&a, &ist))) {
             msg("%s changed during the run: not removed\n", ip); rc = 1;
         } else if (!out_synced) {
             msg("%s: could not sync the directory of OUTPUT: %s not removed\n", op, ip); rc = 1;

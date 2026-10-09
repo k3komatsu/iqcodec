@@ -83,6 +83,7 @@ cmp -s "$T/sv.out" "$T/a.fc32" && fail "salvage: corruption not reported in the 
 tail -c +$((2097152 * 8 + 1)) "$T/sv.out" > "$T/sv.tail"; tail -c +$((2097152 * 8 + 1)) "$T/a.fc32" | cmp - "$T/sv.tail"
 head -c $((2097152 * 8)) "$T/sv.out" | tr -d '\000' | cmp - /dev/null || fail "salvage: chunk not zeroed"
 "$BIN" d --salvage "$T/a.iqc" "$T/sv.out"; cmp "$T/sv.out" "$T/a.fc32"
+if "$BIN" t --salvage "$T/twice.iqc" 2>/dev/null; then fail "salvage: appended stream dropped silently"; fi
 cp "$T/a.iqc" "$T/n1.iqc"; printf '\377\377\037\000' | dd of="$T/n1.iqc" bs=1 seek=16 conv=notrunc 2>/dev/null
 "$BIN" d --salvage "$T/n1.iqc" "$T/sv.out" 2>/dev/null || [ $? = 3 ] || fail "salvage of a damaged chunk size"
 [ $(wc -c < "$T/sv.out") -lt 40000000 ] || fail "damaged chunk size shifted the samples that follow"
@@ -170,6 +171,11 @@ cmp "$T/live4.out" "$T/b.sc16"
 mkfifo "$T/ofifo"; (exec sleep 25 < "$T/ofifo") & rdr=$!
 if live stall "$T/ofifo" 3 0.3 2>/dev/null; then fail "third Ctrl-C did not abort"; fi
 { kill $rdr; wait $rdr || :; } 2>/dev/null
+# a recording that fails (here: an inexact value after two good chunks) is kept for d --salvage
+mkdir "$T/k"; { cat "$T/a.fc32"; printf 'ABCD\000\000\000\000'; } | "$BIN" c - "$T/k/rec.iqc" 2>/dev/null && fail "inexact value accepted"
+set -- "$T"/k/.iqcodec-*; test -f "$1" || fail "failed recording not kept"
+"$BIN" d --salvage "$1" "$T/k/rec.out" 2>/dev/null || [ $? = 3 ] || fail "kept recording not salvageable"
+head -c $((4194304 * 8)) "$T/a.fc32" | cmp - "$T/k/rec.out"
 { cat "$T/b.sc16"; printf x; } | "$BIN" c -f sc16 - "$T/part.iqc" 2>/dev/null   # partial last sample dropped
 "$BIN" d "$T/part.iqc" "$T/part.out"
 cmp "$T/part.out" "$T/b.sc16"
