@@ -57,39 +57,49 @@ with SIGKILL or by a power failure, leaves behind, up to its last fully written 
 
 Without OUTPUT, `c` writes INPUT.iqc and `d` strips `.iqc`, and neither replaces an existing file. `--rm`
 removes INPUT only after success into a regular file that has been synced to disk, and only if INPUT is still
-the same file and was not modified during the run (`c --rm` implies `-t`; it refuses `-l` and symbolic links). On a terminal, progress is
-shown on stderr.
+the same file and was not modified during the run (`c --rm` implies `-t`; it refuses `-l` and symbolic links).
+On a terminal, progress is shown on stderr.
 
 **Recording through a pipe.** When INPUT is a pipe or other stream, Ctrl-C does not throw the capture away.
 The first Ctrl-C lets iqcodec read on until the recorder closes the pipe, then finish the file. A second Ctrl-C
 stops reading at once and finishes the file with what has arrived, and a third aborts. SIGHUP (a closed
 terminal or SSH session) and SIGTERM also finish the file. If a recording fails (disk full, an invalid value) or
-is aborted, the data written so far is kept in a temporary file whose name is printed; `d --salvage` decodes it. A partial last sample is dropped with a warning. The
-recorder must write only samples to the pipe; status messages belong on stderr.
+is aborted, the data written so far is kept in a temporary file whose name is printed; `d --salvage` decodes it.
+A partial last sample is dropped with a warning and exit status 3. The recorder must write only samples to the
+pipe; status messages belong on stderr.
 
 | option | |
 |---|---|
 | `-f fc32\|sc16` | input sample format (compress) |
 | `-s SCALE` | fc32 values are int16 / SCALE (default 32767) |
 | `-l` | allow fc32 input that is not exactly int16 / SCALE (it gets quantized, and checksums and `-t` then cover the quantized values; otherwise iqcodec refuses) |
-| `-t` | compress: decode each chunk after encoding and compare with the input |
+| `-t` | compress: decode each chunk after encoding and compare with the input; a file OUTPUT is then also read back and tested |
 | `-j N` | threads (default: CPUs, at most 8); chunks are coded independently |
 | `-v` | statistics |
 | `--skip N`, `--count M` | `d`, `t`: only samples N to N+M-1 |
 | `--salvage` | `d`, `t`: keep going past damage (see above) |
 | `--rm` | remove INPUT after success |
 
-Options go before INPUT and OUTPUT.
+Options go before INPUT and OUTPUT. Exit status: 0 success, 1 error, 2 usage, 3 incomplete output (`--salvage`
+replaced or dropped data, a `--skip` / `--count` range extends past the end, or a pipe ended inside a sample).
 
 Every chunk stores a CRC-32C of its samples, and the stream ends with the total sample count.
 `d` and `t` check both, so corruption or truncation is an error instead of wrong data.
-`c -t` also catches encoder faults before you delete the original.
+`c -t` also catches encoder faults, and reads a file OUTPUT back from disk, before you delete the original.
 
 A file OUTPUT goes to a temporary file in the same directory. It is synced and renamed into place only on
 success, so a failed or interrupted run never leaves partial output and never replaces an existing file.
 A symlink OUTPUT keeps its link, and its target receives the data. stdout, pipes and devices get data as it
 is decoded, so a failure there can leave partial data. iqcodec refuses an output that is the input file,
 whether by the same path, a symbolic or hard link, or a shell redirection.
+
+## Stream format and compatibility
+
+The format is specified in [FORMAT.md](FORMAT.md), in enough detail to write a decoder without these sources
+(this has been checked with an independent decoder). **Every stream in format version 2, which is what iqcodec
+0.2.0 and later write, stays readable by all later releases.** A change that version-2 readers could not decode
+gets a new version number, and the readers keep reading version 2. [CHANGELOG.md](CHANGELOG.md) states for every
+release whether the format changed. `tests/fixtures` holds reference streams that CI decodes on every change.
 
 ## How it works
 
@@ -106,12 +116,15 @@ Per chunk of 2^21 samples:
   context is the recent residual magnitude. Remaining mantissa bits and the sign are stored raw.
 
 The decoder is integer-only, so streams are identical across platforms. On x86-64, AVX-512 VNNI paths are
-selected at run time (`IQC_NO_SIMD=1` disables them).
+selected at run time, and NEON paths on ARM (`IQC_NO_SIMD=1` disables both).
 
 ## Limitations
 
-- fc32 input must be int16 / SCALE to be lossless. `-0.0` and NaN do not occur in UHD output and are not
-  preserved (`-l` maps them to 0).
+- fc32 input must be exactly what UHD produces: `int16 * (1/SCALE)`, a binary32 multiplication by the
+  binary32 reciprocal. Values made by division (`int16 / 32767.0f`) differ in the last bit for 1536 of the 65536 int16 values (at scale 32767)
+  and are refused rather than stored wrongly. `-l` accepts them, but it stores the nearest UHD-style value, so
+  that is not lossless. `-0.0`, NaN and infinities do not occur in UHD output and are refused (`-l` maps them to
+  0 or clamps them).
 - Samples are complex pairs. sc8/sc12 data can be widened to sc16 first.
 
 ## License

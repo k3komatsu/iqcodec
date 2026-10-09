@@ -16,7 +16,7 @@
 #include "crc32c.h"
 #include "iqc.h"
 
-#define VERSION "0.3.0"
+#define VERSION "0.3.1"
 #define CHUNK (1 << 21)           // complex samples per independently coded chunk
 #define K_ORDER 24
 #define LEAF 8192
