@@ -85,7 +85,8 @@ replaced or dropped data, a `--skip` / `--count` range extends past the end, or 
 
 Every chunk stores a CRC-32C of its samples, and the stream ends with the total sample count.
 `d` and `t` check both, so corruption or truncation is an error instead of wrong data.
-`c -t` also catches encoder faults, and reads a file OUTPUT back from disk, before you delete the original.
+`c -t` also catches encoder faults, and reads a file OUTPUT back and tests it (on Linux after dropping it from the
+page cache, so from the device), before you delete the original.
 
 A file OUTPUT goes to a temporary file in the same directory. It is synced and renamed into place only on
 success, so a failed or interrupted run never leaves partial output and never replaces an existing file.

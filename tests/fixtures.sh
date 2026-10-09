@@ -8,7 +8,7 @@ case $BIN in /*) ;; *) BIN=$(pwd)/$BIN ;; esac
 cd "$(dirname "$0")/fixtures"
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
 n=0
-while read -r sum name how opts; do
+while read -r sum name how opts || [ -n "$sum" ]; do
   case $sum in '#'*|'') continue ;; esac
   [ -f "$name" ] || { echo "FAIL: $name is missing"; exit 1; }
   "$BIN" t "$name" || { echo "FAIL: $name does not decode"; exit 1; }

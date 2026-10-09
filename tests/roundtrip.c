@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
         while ((m = (int64_t)fread(x, 4, CH, in)) > 0) {
             int64_t sz = iqc_encode(x, IQC_SC16, m, scale, shift, K, leaf, 11, buf, (int64_t)CH * 8 + (1 << 20), &inexact);
             uint32_t c = crc32c(0, x, (size_t)m * 4), hd[4] = {(uint32_t)m, (uint32_t)shift, (uint32_t)sz, c};
-            if (sz < 0) return 1;
+            if (sz < 0 || sz > (int64_t)CH * 8 + (1 << 20) || sz > m * 8 + (1 << 20)) return 1;   // FORMAT.md 2.2 limit
             for (int i = 0; i < 16; i++) h[i] = (uint8_t)(hd[i / 4] >> (8 * (i % 4)));   // little-endian u32s
             fwrite(h, 1, 16, o); fwrite(buf, 1, (size_t)sz, o);
             tot += (uint64_t)m;

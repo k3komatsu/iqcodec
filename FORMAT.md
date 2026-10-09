@@ -55,8 +55,7 @@ end     = u32 0  u64 total                                                 (12 b
 | K | prediction order, 1 to 32 (iqcodec writes 24) |
 | prec | coefficient precision the encoder aimed at (iqcodec writes 11). Informational: any value, ignored by readers. |
 | leaf | leaf block length L in samples, 1 to 2^20 (iqcodec writes 8192) |
-| scale | fc32: values are int16 / scale; a reader must check that scale > 0, scale < 1e30 compared in binary32 (scale < 0x7149F2CA as a bit pattern of a positive value), and that `f32(1 / scale)` is finite (so scale is not subnormal: an infinite `inv` would make the output depend on
-the platform's NaN encoding). iqcodec writes 32767 unless told otherwise. sc16: ignored, any value. |
+| scale | fc32: values are int16 / scale. A reader must check that scale > 0, that scale < 1e30 compared in binary32 (below the bit pattern 0x7149F2CA), and that `f32(1 / scale)` is finite, which excludes scales below about 2.94e-39 (an infinite `inv` would make the output depend on the platform's NaN encoding). iqcodec writes 32767 unless told otherwise. sc16: ignored, any value. |
 
 For fc32, compute `inv = f32(1.0 / scale)` once (a binary32 division), then each output value is the binary32
 product `f32(v) * inv` (not `v / scale`). This matches UHD, which converts sc16 to fc32 as `v * (1/32767)`.

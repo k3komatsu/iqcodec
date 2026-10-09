@@ -486,6 +486,10 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
     }
     int fmt = hdr[5];
     float scale; memcpy(&scale, hdr + 12, 4);
+    if (fmt == IQC_FC32 && (!(scale > 0) || !(scale < 1e30f) || !(1.0f / scale <= FLT_MAX))) {   // FORMAT.md 2.1
+        msg("invalid scale in the stream header\n");
+        return 1;
+    }
     size_t ssz = ssize_of(fmt);
     int ns = nth + 2, state[MAX_SLOTS] = {0}, nrun = 0, rc = 1, eof = 0, lost = 0;
     uint64_t nchunks = 0, csize = 16 + 12;
