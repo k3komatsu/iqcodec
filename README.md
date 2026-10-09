@@ -39,7 +39,7 @@ uhd_rx_cfile ... | iqcodec c - out.iqc   # stdin / stdout with -
 
 **Recording through a pipe.** When INPUT is a pipe or other stream, Ctrl-C does not throw the capture away.
 The first Ctrl-C lets iqcodec read on until the recorder closes the pipe, then finish the file. A second Ctrl-C
-stops after the current chunk, and a third aborts. A partial last sample is dropped with a warning. The
+stops reading at once and finishes the file with what has arrived, and a third aborts. A partial last sample is dropped with a warning. The
 recorder must write only samples to the pipe; status messages belong on stderr.
 
 | option | |

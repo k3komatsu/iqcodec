@@ -62,15 +62,20 @@ static char dst_path[PATH_MAX];        // regular-file OUTPUT after following sy
 static const int fatal_sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGXFSZ};
 static volatile sig_atomic_t graceful_int;   // compressing a stream: Ctrl-C finishes the file instead of aborting
 static volatile sig_atomic_t n_int;          // SIGINTs received in graceful mode
+static volatile sig_atomic_t in_fd = -1;     // that stream
 
 static void on_signal(int sig) {
     if (sig == SIGINT && graceful_int && n_int < 2) {
         static const char m1[] = "\niqcodec: interrupted: finishing when the input ends "
-                                 "(Ctrl-C again: stop after the current chunk; a third time: abort)\n";
-        static const char m2[] = "\niqcodec: stopping after the current chunk\n";
+                                 "(Ctrl-C again: stop reading now; a third time: abort)\n";
+        static const char m2[] = "\niqcodec: stopped reading, finishing the file\n";
         n_int++;
+        int e = errno, z;
         ssize_t r = n_int == 1 ? write(STDERR_FILENO, m1, sizeof m1 - 1) : write(STDERR_FILENO, m2, sizeof m2 - 1);
-        (void)r;
+        // second: the input becomes /dev/null, so a read blocked on a stalled producer (resumed by SA_RESTART)
+        // and every later read see EOF
+        if (n_int == 2 && (z = open("/dev/null", O_RDONLY)) >= 0) { dup2(z, in_fd); close(z); }
+        (void)r; errno = e;
         return;
     }
     if (tmp_path[0]) unlink(tmp_path);
@@ -319,7 +324,7 @@ static int compress(FILE *in, FILE *out, int fmt, float scale, int lossy, int ve
     double t0 = now();
     nrun = pool_start(&pl, th, nth);
     if (!nrun) { fprintf(stderr, "iqcodec: cannot start threads\n"); goto fail; }
-    graceful_int = stream;
+    in_fd = fileno(in); graceful_int = stream;
     while (!eof || wr < rd) {
         if (!eof && rd - wr < ns) {   // read the next chunk into the next slot (free: it was written)
             int k = (int)(rd % ns);
