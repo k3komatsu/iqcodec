@@ -4,9 +4,14 @@ This document specifies the `.iqc` stream format written by iqcodec 0.2.0 and la
 a decoder without the iqcodec sources. A decoder that follows it reproduces the original samples bit for bit.
 `tests/fixtures` holds reference streams with the SHA-256 of their decoded samples; use them to check a new decoder.
 
-Compatibility promise: every version-2 stream is readable by every later iqcodec release. A change that an older
-version-2 reader could not decode gets a new version number in the stream header, and the readers keep reading
-version 2. (Version 1, written only by iqcodec 0.1.0, is not supported.)
+Compatibility promise: every version-2 stream that iqcodec writes is readable by every later iqcodec release, and
+from 0.3.1 on, iqcodec reads every stream that is valid under this document (0.2.x and 0.3.0 read only K = 24 and
+leaf = 8192, the values iqcodec writes). A change that a version-2 reader could not decode gets a new version number
+in the stream header, and the readers keep reading version 2. (Version 1, written only by iqcodec 0.1.0, is not
+supported.)
+
+The rules of sections 2 to 4 are normative: a reader rejects a stream that breaks them ("must"). Where a stream is
+corrupt in a way these rules do not catch, the chunk CRC does.
 
 Conventions:
 
@@ -17,6 +22,8 @@ Conventions:
 - Arithmetic is exact (no overflow) unless a width is stated. Every quantity fits in 64-bit signed integers, and the
   bounds in 4.6 keep every prediction sum within 32-bit signed integers.
 - `nbits(v)` for `v >= 0` is the number of bits needed to write v: 0 for 0, else floor(log2 v) + 1.
+- `a .. b` is the inclusive range a, a+1, …, b (empty if b < a).
+- Reads from a stream happen in the order they are written, left to right, also within one expression.
 
 ## 1. Samples
 
@@ -45,12 +52,13 @@ end     = u32 0  u64 total                                                 (12 b
 | version | 2 |
 | fmt | 0 = fc32, 1 = sc16 (output format, section 1) |
 | K | prediction order, 1 to 32 (iqcodec writes 24) |
-| prec | coefficient precision the encoder aimed at, 1 to 15 (iqcodec writes 11). Not needed to decode. |
+| prec | coefficient precision the encoder aimed at (iqcodec writes 11). Informational: any value, ignored by readers. |
 | leaf | leaf block length L in samples, 1 to 2^20 (iqcodec writes 8192) |
-| scale | fc32 only: values are int16 / scale. Positive, finite, below 1e30, with a finite positive `1 / scale` in binary32. iqcodec writes 32767 unless told otherwise. sc16 streams ignore it. |
+| scale | fc32: values are int16 / scale; a reader must check that scale > 0, scale < 1e30 compared in binary32 (scale < 0x7149F2CA as a bit pattern of a positive value), and that `f32(1 / scale)` is greater than 0. iqcodec writes 32767 unless told otherwise. sc16: ignored, any value. |
 
 For fc32, compute `inv = f32(1.0 / scale)` once (a binary32 division), then each output value is the binary32
 product `f32(v) * inv` (not `v / scale`). This matches UHD, which converts sc16 to fc32 as `v * (1/32767)`.
+(Computing `1.0 / scale` in binary64 and rounding it once to binary32 gives the same `inv`.)
 
 ### 2.2 Chunks
 
@@ -124,7 +132,9 @@ gamma():
 
 ### 4.2 Binary range decoder (low)
 
-This is the binary range coder of LZMA, with adaptive probabilities that use a variable rate.
+A binary range decoder in the style of LZMA's, but not identical to it: here `code < bound` decodes a 1,
+probabilities have 16 bits with a variable adaptation rate, and normalisation follows each bit. Follow the
+pseudocode, not LZMA.
 
 State: 32-bit unsigned `range` and `code`, and a byte position in the section. A byte read past the end of the
 section is 0.
@@ -159,7 +169,7 @@ tree(ctrs, nbit):                         (ctrs: an array of counters indexed 1 
     repeat nbit times: node = 2 * node + decode_bit(ctrs[node])
     return node - 2^nbit
 
-gap(ctrs):                                (ctrs: 32 counters; returns an integer >= 1)
+read_gap(ctrs):                           (ctrs: 32 counters; returns an integer >= 1)
     z = 0
     while true:
         b = decode_bit(ctrs[min(z, 31)])
@@ -196,9 +206,9 @@ Each channel (I and Q) has its own *tracker*, its own *gap* state, and its own m
 
 - `amb[32]`;
 - `exc[3][16]`, one tree per mode, nodes 1 .. 2^shift - 1;
-- `gap[32]`.
+- `gapctr[32]`.
 
-All counters start as (32768, 0), and gap starts as -1.
+All counters start as (32768, 0), and the gap state `gap[ch]` starts as -1.
 
 The low bits of a channel form a sequence of symbols `s_t` in 0 .. M-1. Each one is *unwrapped* to an integer `u_t`
 congruent to `s_t` mod M. Over long stretches the cumulative sum of the unwrapped values is a digital straight line
@@ -224,8 +234,10 @@ Tracker: dss                        a DSS
 init: has = 0, k = 0, t = -1, Y = 0, dss and hist all zero
 ```
 
-`hist` really is 16-bit. A slowly drifting low-bit pattern makes `u` grow without bound, and every later read of hist
-returns the wrapped 16-bit value. `Y` is not wrapped.
+`hist` really is 16-bit. A steadily drifting low-bit pattern (for example 0, 1, 2, 3, 0, 1, … unwrapping to 0, 1, 2,
+3, 4, 5, …) pushes `u` just past the int16 range; it is stored wrapped, and later values continue from the wrapped
+value. `Y` is the sum of the unwrapped `u` (not wrapped). It only enters through `Mp` in `rebuild`, where a constant
+offset of the y coordinates does not change any later result, so a decoder may also keep Y = 0.
 
 ```
 dss_start(p):
@@ -326,7 +338,7 @@ low_symbol(ch):
     if mode == N:
         s = tree(mdl.exc[2], shift); u = unwrap(tr, s)
     else:
-        if gap[ch] < 0: gap[ch] = gap(mdl.gap) - 1      (number of regular steps before the next exception)
+        if gap[ch] < 0: gap[ch] = read_gap(mdl.gapctr) - 1   (number of regular steps before the next exception)
         if gap[ch] == 0:                                 (exception: the symbol is coded explicitly)
             s = tree(mdl.exc[mode], shift); u = unwrap(tr, s); gap[ch] = -1
         else:
@@ -356,14 +368,16 @@ for ch in 0, 1:
             freq[ch][c][sy] = f;  start[ch][c][sy] = start;  start = start + f
 ```
 
-In a used table the frequencies add up to exactly 4096, and a reader must reject a table whose running sum exceeds
-4096. An unused table is never referenced by a valid stream.
+A reader must reject a used table whose frequencies do not add up to exactly 4096, or that gives one of the symbols
+60 to 63 a nonzero frequency (4.5.2). Valid streams never reference an unused table; a reader may reject that, or
+leave it to the CRC. (iqcodec 0.2.x and 0.3.0 checked only that the running sum stays within 4096; 0.3.1 checks the
+full rule. Streams written by any iqcodec satisfy it.)
 
 #### 4.5.2 Symbols
 
 A residual r is coded as a symbol (rANS) plus raw bits. The symbol carries the magnitude class
-`b = nbits(|r|)` (0 to 16) and the top `tb = min(b - 1, 2)` mantissa bits. The raw stream carries the remaining
-`b - 1 - tb` mantissa bits and the sign. The symbol table is:
+`b = nbits(|r|)` (0 to 16) and the top `tb = min(b - 1, 2)` mantissa bits. The raw stream carries, for b >= 1, the
+sign (first bit) and then the remaining `b - 1 - tb` mantissa bits, as one `nraw`-bit field. The symbol table is:
 
 ```
 symbol 0: r = 0, no raw bits
@@ -371,7 +385,7 @@ then, for b = 1 .. 16, nm = b - 1, tb = min(nm, 2), for top = 0 .. 2^tb - 1 (in 
     next symbol: base = 2^nm + top * 2^(nm - tb),  nraw = nm - tb + 1
 ```
 
-This gives symbols 0 to 59; 60 to 63 do not occur. To decode a residual from symbol sy:
+This gives symbols 0 to 59; 60 to 63 have zero frequency in every table. To decode a residual from symbol sy:
 
 ```
 v = bits_raw(nraw[sy])                        (from the raw stream, 4.1)
@@ -411,7 +425,9 @@ block's coefficients:
 ```
 for S0 = 0, 4L, 8L, ... while S0 < n:
     split = bits(1)
-    if split == 1: split = split + 2 * bits(1) + 4 * bits(1)
+    if split == 1:
+        split = split + 2 * bits(1)                  (first)
+        split = split + 4 * bits(1)                  (second)
     bounds (in leaves):  split bit 0 clear:           [0, 4]
                          otherwise: [0] + ([1] if bit 1) + [2] + ([3] if bit 2) + [4]
     for each pair of consecutive bounds (i0, i1):
@@ -461,14 +477,18 @@ stream matters. Each is consumed in sample order, with I before Q.
 
 Finally compare the CRC-32C of the chunk's output with `crc`.
 
+Corruption inside the sections is detected by the checks above (tables, block parameters, the [hmin, hmax] range)
+and by the CRC. Readers are not required to check that sections are consumed exactly, or the final rANS and range
+coder states. Reads past the end of a section give zero bits or zero bytes, and the rANS decoder skips
+renormalisation when fewer than 2 bytes remain; valid streams never depend on either.
+
 ## 5. Writers (informative)
 
 iqcodec 0.2.0 to 0.3.x write K = 24, prec = 11, leaf = 8192 and scale = 32767 (or `-s`). They also:
 
 - choose the shift once per stream, from the first 65536 samples;
-- make every chunk except the last exactly 2^21 samples;
 - choose the split of each superblock and the coefficients by least squares.
 
-None of these choices is needed to decode. Readers from iqcodec 0.3.1 on accept any K, leaf and prec in the ranges
-above. 0.2.x and 0.3.0 readers require K = 24 and leaf = 8192. The streams in `tests/fixtures` marked `wrap` use
+None of these choices is needed to decode (the chunk sizes of 2.2, by contrast, are a rule of the format). Readers
+from iqcodec 0.3.1 on accept any K, leaf and prec in the ranges above. 0.2.x and 0.3.0 readers require K = 24 and leaf = 8192. The streams in `tests/fixtures` marked `wrap` use
 other values.

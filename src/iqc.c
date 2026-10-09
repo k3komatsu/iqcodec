@@ -1051,6 +1051,7 @@ int iqc_decode(const uint8_t *in, int64_t len, void *out, int fmt, int64_t n, fl
             t->freq[sy] = (uint16_t)f; t->start[sy] = (uint16_t)st;
             memset(d->lut[ch][c] + st, sy, f); st += f;
         }
+        if (st != PROB_SCALE || t->freq[60] | t->freq[61] | t->freq[62] | t->freq[63]) goto done;   // FORMAT.md 4.5
     }
     init_syms();
     const uint8_t *rp = d->rp;
