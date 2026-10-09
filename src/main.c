@@ -30,8 +30,8 @@ enum { CMD_C, CMD_D, CMD_T, CMD_I };
 static void usage(FILE *f) {
     fprintf(f,
         "iqcodec " VERSION " - lossless compression for IQ captures\n\n"
-        "usage: iqcodec c [options] INPUT OUTPUT    compress\n"
-        "       iqcodec d [options] INPUT OUTPUT    decompress (checksums verified)\n"
+        "usage: iqcodec c [options] INPUT [OUTPUT]  compress (default OUTPUT: INPUT.iqc)\n"
+        "       iqcodec d [options] INPUT [OUTPUT]  decompress, checksums verified (default: INPUT without .iqc)\n"
         "       iqcodec t [options] INPUT           test: decompress and verify checksums, no output\n"
         "       iqcodec i INPUT                     info: format, samples, size (structure checked, data not decoded)\n"
         "       (use - for stdin / stdout)\n\n"
@@ -42,6 +42,7 @@ static void usage(FILE *f) {
         "  -t        with c: decode every chunk right after encoding and compare with the input\n"
         "  -j N      threads (default: number of CPUs, at most 8)\n"
         "  -v        print statistics\n"
+        "  --rm      remove INPUT after success (c implies -t)\n"
         "  --skip N  with d / t: start at sample N (complex samples, counted from 0)\n"
         "  --count N with d / t: at most N samples; only the chunks covering the range are read\n"
         "  --salvage with d / t: keep going past damage: a corrupt chunk becomes zeros, a truncated or damaged\n"
@@ -49,7 +50,8 @@ static void usage(FILE *f) {
         "  -h, -V    help, version\n\n"
         "A file OUTPUT is written to a temporary file and renamed when complete, so an existing file is\n"
         "replaced only on success (stdout, pipes and devices receive data as it is decoded). INPUT and\n"
-        "OUTPUT must not be the same file. Options go before INPUT / OUTPUT.\n");
+        "OUTPUT must not be the same file. A default OUTPUT never replaces an existing file.\n"
+        "Options go before INPUT / OUTPUT.\n");
 }
 
 static void put32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
@@ -520,9 +522,9 @@ int main(int argc, char **argv) {
 #endif
     char *end;
     uint64_t skip = 0, count = UINT64_MAX;
-    int ranged = 0, salvage = 0;
+    int ranged = 0, salvage = 0, rm = 0;
     static const struct option longopts[] = {{"skip", required_argument, NULL, 'S'}, {"count", required_argument, NULL, 'C'},
-                                             {"salvage", no_argument, NULL, 'R'}, {0, 0, 0, 0}};
+                                             {"salvage", no_argument, NULL, 'R'}, {"rm", no_argument, NULL, 'X'}, {0, 0, 0, 0}};
     while ((opt = getopt_long(argc, argv, optstr, longopts, NULL)) != -1) {
         switch (opt) {
         case 'f':
@@ -553,16 +555,33 @@ int main(int argc, char **argv) {
             break;
         }
         case 'R': salvage = 1; break;
+        case 'X': rm = 1; break;
         case 'v': verbose = 1; break;
         case 'V': puts("iqcodec " VERSION); return 0;
         case 'h': usage(stdout); return 0;
         default: usage(stderr); return 2;
         }
     }
-    if (argc - optind != (cmd >= CMD_T ? 1 : 2)) { usage(stderr); return 2; }
+    int nop = argc - optind;
+    if (cmd >= CMD_T ? nop != 1 : nop < 1 || nop > 2) { usage(stderr); return 2; }
     if ((ranged || salvage) && (cmd == CMD_C || cmd == CMD_I)) { fprintf(stderr, "iqcodec: --skip, --count and --salvage are for d and t\n"); return 2; }
     uint64_t lim = count > UINT64_MAX - skip ? UINT64_MAX : skip + count;
+    if (rm && (cmd >= CMD_T || ranged || salvage)) { fprintf(stderr, "iqcodec: --rm is for plain c and d\n"); return 2; }
     const char *ip = argv[optind], *op = cmd >= CMD_T ? NULL : argv[optind + 1];
+    char auto_op[PATH_MAX];
+    if (cmd < CMD_T && nop == 1) {   // like gzip: FILE <-> FILE.iqc, never replacing an existing file
+        size_t l = strlen(ip);
+        if (!strcmp(ip, "-")) { fprintf(stderr, "iqcodec: OUTPUT is needed with stdin\n"); return 2; }
+        if (cmd == CMD_D && (l <= 4 || strcmp(ip + l - 4, ".iqc"))) { fprintf(stderr, "iqcodec: %s: no .iqc suffix; give OUTPUT\n", ip); return 2; }
+        if (snprintf(auto_op, sizeof auto_op, "%.*s%s", (int)(cmd == CMD_D ? l - 4 : l), ip, cmd == CMD_D ? "" : ".iqc") >= (int)sizeof auto_op) {
+            fprintf(stderr, "iqcodec: %s: name too long\n", ip); return 2;
+        }
+        struct stat st;
+        if (lstat(auto_op, &st) == 0) { fprintf(stderr, "iqcodec: %s already exists\n", auto_op); return 1; }
+        op = auto_op;
+    }
+    if (rm && !strcmp(ip, "-")) { fprintf(stderr, "iqcodec: --rm needs a file INPUT\n"); return 2; }
+    if (rm && cmd == CMD_C) verify = 1;   // nothing is deleted that has not been decoded and compared
     FILE *in = strcmp(ip, "-") ? fopen(ip, "rb") : stdin;
     if (!in) { fprintf(stderr, "iqcodec: %s: %s\n", ip, strerror(errno)); return 1; }
     if (cmd >= CMD_T) {
@@ -573,10 +592,15 @@ int main(int argc, char **argv) {
     install_signal_handlers();
     FILE *out = open_output(op, in);
     if (!out) { if (in != stdin) fclose(in); return 1; }
+    if (rm && !tmp_path[0]) {   // the data must end up in a file of its own
+        fprintf(stderr, "iqcodec: --rm needs a regular file OUTPUT\n");
+        close_output(out, op, 0); if (in != stdin) fclose(in); return 2;
+    }
     struct stat ist;
     int stream = !(fstat(fileno(in), &ist) == 0 && S_ISREG(ist.st_mode));
     int rc = cmd == CMD_D ? decompress(in, out, nth, verbose, skip, lim, 0, salvage) : compress(in, out, fmt, scale, lossy, verify, nth, verbose, stream);
     if (!close_output(out, op, rc == 0 || rc == 3)) rc = 1;
     if (in != stdin) fclose(in);
+    if (rm && rc == 0 && !stream && unlink(ip)) { fprintf(stderr, "iqcodec: cannot remove %s: %s\n", ip, strerror(errno)); rc = 1; }
     return rc;
 }

@@ -165,6 +165,23 @@ if live stall "$T/ofifo" 3 0.3 2>/dev/null; then fail "third Ctrl-C did not abor
 "$BIN" d "$T/part.iqc" "$T/part.out"
 cmp "$T/part.out" "$T/b.sc16"
 
+# default OUTPUT (FILE <-> FILE.iqc, never replacing a file) and --rm (only after success into a regular file)
+mkdir "$T/n"; cp "$T/b.sc16" "$T/n/x.sc16"
+"$BIN" c -f sc16 "$T/n/x.sc16"
+must_fail "$BIN" c -f sc16 "$T/n/x.sc16"                          # x.sc16.iqc exists
+must_fail "$BIN" d "$T/n/x.sc16.iqc"                              # x.sc16 exists
+rm "$T/n/x.sc16"; "$BIN" d --rm "$T/n/x.sc16.iqc"
+test ! -e "$T/n/x.sc16.iqc" || fail "d --rm kept its input"
+cmp "$T/n/x.sc16" "$T/b.sc16"
+"$BIN" c --rm -f sc16 "$T/n/x.sc16"
+test ! -e "$T/n/x.sc16" || fail "c --rm kept its input"
+must_fail "$BIN" d --rm "$T/n/x.sc16.iqc" /dev/null
+must_fail "$BIN" d --rm --skip 1 "$T/n/x.sc16.iqc" "$T/n/y"
+cp "$T/bad.iqc" "$T/n/bad.iqc"; must_fail "$BIN" d --rm "$T/n/bad.iqc"
+test -e "$T/n/x.sc16.iqc" && test -e "$T/n/bad.iqc" || fail "--rm removed an input after a failure"
+must_fail "$BIN" d "$T/n/noext"
+must_fail "$BIN" c -
+
 # options
 must_fail "$BIN" c -j x "$T/a.fc32" "$T/o.iqc"
 must_fail "$BIN" c -j 0 "$T/a.fc32" "$T/o.iqc"
