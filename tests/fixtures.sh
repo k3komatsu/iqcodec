@@ -8,12 +8,12 @@ case $BIN in /*) ;; *) BIN=$(pwd)/$BIN ;; esac
 cd "$(dirname "$0")/fixtures"
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
 n=0
-while read -r sum name how fmt; do
+while read -r sum name how opts; do
   case $sum in '#'*|'') continue ;; esac
   got=$("$BIN" d "$name" - | sha)
   [ "$got" = "$sum" ] || { echo "FAIL: $name decodes to different samples"; exit 1; }
   if [ "$how" = c ]; then
-    "$BIN" d "$name" - | "$BIN" c -f "$fmt" - - | cmp -s - "$name" || { echo "FAIL: $name is no longer reproduced by c"; exit 1; }
+    "$BIN" d "$name" - | "$BIN" c $opts - - | cmp -s - "$name" || { echo "FAIL: $name is no longer reproduced by c"; exit 1; }
   fi
   n=$((n + 1))
 done < MANIFEST
