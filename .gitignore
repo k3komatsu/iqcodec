@@ -4,3 +4,4 @@ tests/roundtrip
 *.dat
 *.iqc
 *.dSYM/
+!tests/fixtures/*.iqc
