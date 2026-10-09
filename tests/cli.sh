@@ -83,6 +83,9 @@ cmp -s "$T/sv.out" "$T/a.fc32" && fail "salvage: corruption not reported in the 
 tail -c +$((2097152 * 8 + 1)) "$T/sv.out" > "$T/sv.tail"; tail -c +$((2097152 * 8 + 1)) "$T/a.fc32" | cmp - "$T/sv.tail"
 head -c $((2097152 * 8)) "$T/sv.out" | tr -d '\000' | cmp - /dev/null || fail "salvage: chunk not zeroed"
 "$BIN" d --salvage "$T/a.iqc" "$T/sv.out"; cmp "$T/sv.out" "$T/a.fc32"
+cp "$T/a.iqc" "$T/n1.iqc"; printf '\377\377\037\000' | dd of="$T/n1.iqc" bs=1 seek=16 conv=notrunc 2>/dev/null
+"$BIN" d --salvage "$T/n1.iqc" "$T/sv.out" 2>/dev/null || [ $? = 3 ] || fail "salvage of a damaged chunk size"
+[ $(wc -c < "$T/sv.out") -lt 40000000 ] || fail "damaged chunk size shifted the samples that follow"
 must_fail "$BIN" d "$T/bad.iqc" "$T/bad.out"
 test ! -e "$T/bad.out" || fail "partial output left behind"
 head -c 1000000 "$T/a.iqc" > "$T/short.iqc"
@@ -199,9 +202,17 @@ printf '{"global": {"core:datatype": "ci16_le", "core:version": "1.0.0"}}' > "$T
 "$BIN" i "$T/n/s.sigmf-data.iqc" | grep -q "^format   sc16" || fail "sigmf datatype ignored"
 printf '{"global": {"core:datatype": "ri8"}}' > "$T/n/s.sigmf-meta"
 must_fail "$BIN" c "$T/n/s.sigmf-data" "$T/n/s2.iqc"
+printf '{"global": {"core:datatype": "ci16_le' > "$T/n/s.sigmf-meta"   # unterminated
+must_fail "$BIN" c "$T/n/s.sigmf-data" "$T/n/s2.iqc"
+rm "$T/n/s.sigmf-meta"; mkfifo "$T/n/s.sigmf-meta"                  # refused, not waited on
+must_fail "$BIN" c "$T/n/s.sigmf-data" "$T/n/s2.iqc"
 "$BIN" c -f sc16 "$T/n/s.sigmf-data" "$T/n/s2.iqc"
 
 # options
+(cd "$T/n" && "$BIN" d x.sc16.iqc -out && test -f ./-out) || fail "operand starting with - parsed as an option"
+must_fail "$BIN" d "$T/a.iqc" "$T/o.out" --skip 5                  # options go first
+must_fail "$BIN" d --skip " 1" "$T/a.iqc" "$T/o.out"
+must_fail "$BIN" d --skip +1 "$T/a.iqc" "$T/o.out"
 must_fail "$BIN" c -j x "$T/a.fc32" "$T/o.iqc"
 must_fail "$BIN" c -j 0 "$T/a.fc32" "$T/o.iqc"
 must_fail "$BIN" c -s 1e39 "$T/a.fc32" "$T/o.iqc"

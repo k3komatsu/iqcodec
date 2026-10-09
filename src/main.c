@@ -453,6 +453,7 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
     size_t ssz = ssize_of(fmt);
     int ns = nth + 2, state[MAX_SLOTS] = {0}, nrun = 0, rc = 1, eof = 0, lost = 0;
     uint64_t nchunks = 0, csize = 16 + 12;
+    uint32_t prev_n = CHUNK;
     const char *why;
     if (info) skip = lim = UINT64_MAX;
     Job jobs[MAX_SLOTS];
@@ -481,14 +482,16 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
                 why = "sample count mismatch (corrupt end marker or missing chunks)";
                 if (want != have) goto bad;
                 why = "unexpected data after the end of the stream";
-                if (fgetc(in) != EOF) goto bad;
+                if (fgetc(in) != EOF) { if (!salvage) goto bad; msg("%s (ignored)\n", why); }
                 if (ferror(in)) { msg("read error: %s\n", strerror(errno)); goto fail; }
                 eof = 1;
             } else {
                 if (read_full(in, ch + 4, 12) != 12) goto bad;
                 uint32_t sz = get32(ch + 8);
                 why = "corrupt chunk header";
-                if (n > CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto bad;
+                // every chunk but the last is full, so a damaged n cannot shift the samples that follow
+                if (n > CHUNK || prev_n != CHUNK || ch[4] > 3 || sz < 24 || sz > (uint64_t)n * 8 + (1 << 20)) goto bad;
+                prev_n = n;
                 why = "truncated input";
                 nchunks++; csize += 16 + (uint64_t)sz;
                 if (have + n <= skip) {   // before the range
@@ -526,7 +529,7 @@ static int decompress(FILE *in, FILE *out, int nth, int verbose, uint64_t skip, 
         Job *j = &jobs[k];
         if (j->err) {
             msg("samples %llu-%llu: %s%s\n", (unsigned long long)j->first, (unsigned long long)(j->first + j->n - 1),
-                    j->err == 2 ? "checksum mismatch (corrupt data)" : "corrupt data", salvage ? ", replaced by zeros" : "");
+                    j->err == 2 ? "checksum mismatch (corrupt data)" : "corrupt data", salvage && out ? ", replaced by zeros" : "");
             if (!salvage) goto fail;
             memset(j->raw, 0, (size_t)j->n * ssz); lost = 1;
         }
@@ -559,19 +562,29 @@ fail:
 // SigMF: the sample format of NAME.sigmf-data from "core:datatype" in NAME.sigmf-meta. -1: none or unsupported.
 static int sigmf_format(const char *data) {
     size_t l = strlen(data);
-    char meta[PATH_MAX], buf[1 << 16];
+    char meta[PATH_MAX], dt[32] = "", q = 0;
     if (l < 11 || strcmp(data + l - 11, ".sigmf-data") || l >= sizeof meta) return -1;
     memcpy(meta, data, l - 4); strcpy(meta + l - 4, "meta");
-    FILE *f = fopen(meta, "rb");
-    if (!f) { msg("%s: %s\n", meta, strerror(errno)); return -1; }
-    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    int fd = open(meta, O_RDONLY | O_NONBLOCK);   // a FIFO must not block
+    FILE *f = fd >= 0 ? fdopen(fd, "rb") : NULL;
+    if (fd >= 0 && !f) close(fd);
+    struct stat st;
+    if (!f || fstat(fileno(f), &st) || !S_ISREG(st.st_mode) || st.st_size > (1 << 26)) {
+        msg("%s: %s\n", meta, f ? "not a regular file of at most 64 MB" : strerror(errno));
+        if (f) fclose(f);
+        return -1;
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
+    size_t n = buf ? fread(buf, 1, (size_t)st.st_size, f) : 0;
     fclose(f);
+    if (!buf) { msg("out of memory\n"); return -1; }
     buf[n] = 0;
-    char *p = strstr(buf, "\"core:datatype\""), dt[32] = "";
-    if (p) sscanf(p + 15, " : \"%31[^\"]\"", dt);
+    char *p = strstr(buf, "\"core:datatype\"");
+    if (!p || sscanf(p + 15, " : \"%31[^\"]%c", dt, &q) != 2 || q != '"') dt[0] = 0;
+    free(buf);
     if (!strcmp(dt, "cf32_le")) return IQC_FC32;
     if (!strcmp(dt, "ci16_le")) return IQC_SC16;
-    msg("%s: datatype \"%s\" is not supported (cf32_le, ci16_le)\n", meta, dt);
+    msg("%s: core:datatype %s%s%s is not supported (cf32_le, ci16_le)\n", meta, *dt ? "\"" : "missing", dt, *dt ? "\"" : "");
     return -1;
 }
 
@@ -586,11 +599,7 @@ int main(int argc, char **argv) {
     int nth = ncpu < 1 ? 1 : ncpu > 8 ? 8 : (int)ncpu;
     float scale = 32767.0f;
     optind = 2;
-#ifdef __GLIBC__
-    const char *optstr = "+f:s:ltj:vhV";   // like BSD: options before operands only
-#else
-    const char *optstr = "f:s:ltj:vhV";
-#endif
+    const char *optstr = "+f:s:ltj:vhV";   // options before operands only (getopt_long permutes otherwise)
     char *end;
     uint64_t skip = 0, count = UINT64_MAX;
     int ranged = 0, salvage = 0, rm = 0;
@@ -620,7 +629,7 @@ int main(int argc, char **argv) {
         case 'S': case 'C': {
             errno = 0;
             unsigned long long v = strtoull(optarg, &end, 10);
-            if (*end || end == optarg || *optarg == '-' || errno) { msg("bad sample count %s\n", optarg); return 2; }
+            if (*end || end == optarg || *optarg < '0' || *optarg > '9' || errno) { msg("bad sample count %s\n", optarg); return 2; }
             if (opt == 'S') skip = v; else count = v;
             ranged = 1;
             break;
