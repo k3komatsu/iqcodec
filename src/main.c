@@ -16,7 +16,7 @@
 #include "crc32c.h"
 #include "iqc.h"
 
-#define VERSION "0.2.2"
+#define VERSION "0.3.0"
 #define CHUNK (1 << 21)           // complex samples per independently coded chunk
 #define K_ORDER 24
 #define LEAF 8192
@@ -37,7 +37,8 @@ static void usage(FILE *f) {
         "       iqcodec i INPUT                     info: format, samples, size (structure checked, data not decoded)\n"
         "       (use - for stdin / stdout)\n\n"
         "options:\n"
-        "  -f FMT    input sample format for c: fc32 (complex float32, default) or sc16 (complex int16)\n"
+        "  -f FMT    input sample format for c: fc32 (complex float32, default) or sc16 (complex int16);\n"
+        "            for NAME.sigmf-data the default comes from core:datatype in NAME.sigmf-meta\n"
         "  -s SCALE  fc32 values are int16 / SCALE (default 32767, as UHD converts sc16 to fc32)\n"
         "  -l        lossy: allow fc32 input that is not exactly int16 / SCALE (it is quantized)\n"
         "  -t        with c: decode every chunk right after encoding and compare with the input\n"
@@ -534,12 +535,31 @@ fail:
     return rc;
 }
 
+// SigMF: the sample format of NAME.sigmf-data from "core:datatype" in NAME.sigmf-meta. -1: none or unsupported.
+static int sigmf_format(const char *data) {
+    size_t l = strlen(data);
+    char meta[PATH_MAX], buf[1 << 16];
+    if (l < 11 || strcmp(data + l - 11, ".sigmf-data") || l >= sizeof meta) return -1;
+    memcpy(meta, data, l - 4); strcpy(meta + l - 4, "meta");
+    FILE *f = fopen(meta, "rb");
+    if (!f) { msg("%s: %s\n", meta, strerror(errno)); return -1; }
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *p = strstr(buf, "\"core:datatype\""), dt[32] = "";
+    if (p) sscanf(p + 15, " : \"%31[^\"]\"", dt);
+    if (!strcmp(dt, "cf32_le")) return IQC_FC32;
+    if (!strcmp(dt, "ci16_le")) return IQC_SC16;
+    msg("%s: datatype \"%s\" is not supported (cf32_le, ci16_le)\n", meta, dt);
+    return -1;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && (!strcmp(argv[1], "-V") || !strcmp(argv[1], "--version"))) { puts("iqcodec " VERSION); return 0; }
     if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) { usage(stdout); return 0; }
     if (argc < 2 || strlen(argv[1]) != 1 || !strchr("cdti", argv[1][0])) { usage(stderr); return 2; }
     int cmd = argv[1][0] == 'c' ? CMD_C : argv[1][0] == 'd' ? CMD_D : argv[1][0] == 't' ? CMD_T : CMD_I;
-    int fmt = IQC_FC32, lossy = 0, verify = 0, verbose = 0, opt;
+    int fmt = -1, lossy = 0, verify = 0, verbose = 0, opt;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     prog_on = isatty(STDERR_FILENO);
     int nth = ncpu < 1 ? 1 : ncpu > 8 ? 8 : (int)ncpu;
@@ -611,6 +631,8 @@ int main(int argc, char **argv) {
         op = auto_op;
     }
     if (rm && !strcmp(ip, "-")) { msg("--rm needs a file INPUT\n"); return 2; }
+    if (cmd == CMD_C && fmt < 0 && strlen(ip) > 11 && !strcmp(ip + strlen(ip) - 11, ".sigmf-data") && (fmt = sigmf_format(ip)) < 0) return 2;
+    if (fmt < 0) fmt = IQC_FC32;
     if (rm && cmd == CMD_C) verify = 1;   // nothing is deleted that has not been decoded and compared
     FILE *in = strcmp(ip, "-") ? fopen(ip, "rb") : stdin;
     if (!in) { msg("%s: %s\n", ip, strerror(errno)); return 1; }

@@ -182,6 +182,15 @@ test -e "$T/n/x.sc16.iqc" && test -e "$T/n/bad.iqc" || fail "--rm removed an inp
 must_fail "$BIN" d "$T/n/noext"
 must_fail "$BIN" c -
 
+# SigMF: the format comes from core:datatype unless -f is given
+cp "$T/b.sc16" "$T/n/s.sigmf-data"
+printf '{"global": {"core:datatype": "ci16_le", "core:version": "1.0.0"}}' > "$T/n/s.sigmf-meta"
+"$BIN" c "$T/n/s.sigmf-data"
+"$BIN" i "$T/n/s.sigmf-data.iqc" | grep -q "^format   sc16" || fail "sigmf datatype ignored"
+printf '{"global": {"core:datatype": "ri8"}}' > "$T/n/s.sigmf-meta"
+must_fail "$BIN" c "$T/n/s.sigmf-data" "$T/n/s2.iqc"
+"$BIN" c -f sc16 "$T/n/s.sigmf-data" "$T/n/s2.iqc"
+
 # options
 must_fail "$BIN" c -j x "$T/a.fc32" "$T/o.iqc"
 must_fail "$BIN" c -j 0 "$T/a.fc32" "$T/o.iqc"

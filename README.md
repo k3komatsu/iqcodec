@@ -29,13 +29,34 @@ make && make test && make install PREFIX=/usr/local
 ## Usage
 
 ```sh
-iqcodec c capture.dat capture.iqc        # compress (fc32 input)
-iqcodec c -t capture.dat capture.iqc     # ... and verify by decoding right away
-iqcodec d capture.iqc capture.dat        # decompress (checksums verified)
+iqcodec c capture.dat                    # compress fc32 input to capture.dat.iqc
+iqcodec c --rm capture.dat               # ... verify by decoding, then remove capture.dat
+iqcodec d capture.dat.iqc                # decompress to capture.dat (checksums verified)
+iqcodec c capture.dat out.iqc            # explicit OUTPUT (replaces an existing file on success)
 iqcodec t capture.iqc                    # verify only, no output
-iqcodec c -f sc16 capture.sc16 out.iqc   # int16 input
+iqcodec i capture.iqc                    # format, sample count, size
+iqcodec c -f sc16 capture.sc16           # int16 input
 uhd_rx_cfile ... | iqcodec c - out.iqc   # stdin / stdout with -
 ```
+
+**Part of a capture.** `--skip N --count M` decodes samples N to N+M-1 (complex samples, from 0). Only the
+chunks that overlap the range are read and checked, so this is fast anywhere in a large file:
+
+```sh
+iqcodec d --skip 70000000 --count 1000000 capture.iqc part.dat
+```
+
+**Damaged files.** `d --salvage` decodes what it can: a chunk that fails its checksum becomes zeros (and is
+reported), and a truncated or damaged stream ends at the last good chunk. The exit status is 3 when anything
+was lost, and OUTPUT is kept. This also recovers the temporary file (`.iqcodec-XXXXXX`) that a killed or
+powered-off recording leaves behind. `t --salvage` lists every bad chunk.
+
+**SigMF.** For `NAME.sigmf-data`, the input format comes from `core:datatype` in `NAME.sigmf-meta`
+(`cf32_le` or `ci16_le`) unless `-f` is given.
+
+Without OUTPUT, `c` writes INPUT.iqc and `d` strips `.iqc`, and neither replaces an existing file. `--rm`
+removes INPUT only after success into a regular file (`c --rm` implies `-t`). On a terminal, progress is
+shown on stderr.
 
 **Recording through a pipe.** When INPUT is a pipe or other stream, Ctrl-C does not throw the capture away.
 The first Ctrl-C lets iqcodec read on until the recorder closes the pipe, then finish the file. A second Ctrl-C
@@ -50,6 +71,9 @@ recorder must write only samples to the pipe; status messages belong on stderr.
 | `-t` | compress: decode each chunk after encoding and compare with the input |
 | `-j N` | threads (default: CPUs, at most 8); chunks are coded independently |
 | `-v` | statistics |
+| `--skip N`, `--count M` | `d`, `t`: only samples N to N+M-1 |
+| `--salvage` | `d`, `t`: keep going past damage (see above) |
+| `--rm` | remove INPUT after success |
 
 Options go before INPUT and OUTPUT.
 
