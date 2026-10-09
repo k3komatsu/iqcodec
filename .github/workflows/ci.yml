@@ -11,4 +11,7 @@ jobs:
       - run: make test
       - run: IQC_NO_SIMD=1 ./tests/roundtrip
       - name: sanitizers
+        # GCC 13 puts 64-byte-aligned (AVX-512) locals misaligned on ASan's fake stack (GCC PR 110027, fixed in 14)
+        env:
+          ASAN_OPTIONS: detect_stack_use_after_return=0
         run: make clean && make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all"
